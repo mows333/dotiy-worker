@@ -1,0 +1,24 @@
+name = "dotiy-api"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "dotiy-assets"
+
+[[r2_buckets]]
+binding = "DELIVERIES"
+bucket_name = "dotiy-deliveries"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dotiy-db"
+database_id = "PLACEHOLDER_DATABASE_ID"
+
+[vars]
+ALLOWED_ORIGIN = "https://dotiy.de"
+
+# Secrets — set via Cloudflare Dashboard → Workers → dotiy-api → Settings → Variables
+# ADMIN_SECRET
+# RESEND_API_KEY
