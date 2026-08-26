@@ -14,7 +14,7 @@ bucket_name = "dotiy-deliveries"
 [[d1_databases]]
 binding = "DB"
 database_name = "dotiy-db"
-database_id = "PLACEHOLDER_DATABASE_ID"
+database_id = "1c8d632a-627a-4294-8429-806640386e7f"
 
 [vars]
 ALLOWED_ORIGIN = "https://dotiy.de"
