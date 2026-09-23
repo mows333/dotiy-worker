@@ -22,6 +22,17 @@ export default {
 
     try {
 
+      // ── dash.dotiy.de → proxy admin panel from Pages ──────────────────────
+      const host = request.headers.get('host') || '';
+      if (host === 'dash.dotiy.de') {
+        const targetPath = (url.pathname === '/' || url.pathname === '') ? '/admin' : url.pathname;
+        const targetUrl  = `https://dotiy.pages.dev${targetPath}${url.search}`;
+        return fetch(new Request(targetUrl, {
+          method:  request.method,
+          headers: { 'user-agent': request.headers.get('user-agent') || '' },
+        }));
+      }
+
       // ── Public: GET /assets/:key — serve file from R2 (with Range support) ─
       const assetMatch = path.match(/^\/assets\/(.+)$/);
       if (assetMatch && method === 'GET') {

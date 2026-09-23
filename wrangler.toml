@@ -20,6 +20,10 @@ database_id = "1c8d632a-627a-4294-8429-806640386e7f"
 [vars]
 ALLOWED_ORIGIN = "https://dotiy.de"
 
+[[routes]]
+pattern = "dash.dotiy.de/*"
+zone_name = "dotiy.de"
+
 # Secrets — set via Cloudflare Dashboard → Workers → dotiy-api → Settings → Variables
 # ADMIN_SECRET
 # RESEND_API_KEY
