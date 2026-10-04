@@ -3,6 +3,7 @@ main = "src/index.js"
 compatibility_date = "2024-01-01"
 account_id = "ac63b79cfe13798f489dd3c7087f2921"
 compatibility_flags = ["nodejs_compat"]
+workers_dev = true
 
 [[r2_buckets]]
 binding = "ASSETS"
