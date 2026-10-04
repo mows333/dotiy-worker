@@ -18,8 +18,19 @@ binding = "DB"
 database_name = "dotiy-db"
 database_id = "1c8d632a-627a-4294-8429-806640386e7f"
 
+# Sandbox for developer mode (X-Dotiy-Mode: dev)
+[[d1_databases]]
+binding = "DB_DEV"
+database_name = "dotiy-db-dev"
+database_id = "d6e83bea-9777-4177-9f2c-73e3475a2b25"
+
+[[r2_buckets]]
+binding = "DEV_BUCKET"
+bucket_name = "dotiy-dev"
+
 [vars]
 ALLOWED_ORIGIN = "https://dotiy.de"
+DEV_EMAIL = "dev@dotiy.de"
 
 [[routes]]
 pattern = "dash.dotiy.de/*"

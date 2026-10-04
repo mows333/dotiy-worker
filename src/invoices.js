@@ -2,6 +2,7 @@
 // (the free Workers plan only allows 10 ms CPU); this module stores, numbers, archives and emails them.
 // GoBD: once finalized an invoice is frozen — no edits, no deletion, corrections only via credit note.
 import { invoiceEmail } from './invoice-email.js';
+import { sendMail } from './mail.js';
 
 const now = () => new Date().toISOString();
 const uid = () => crypto.randomUUID();
@@ -169,7 +170,7 @@ export async function handleInvoices(request, env, url, json) {
       const credit = (data.type || row.type) === 'credit';
       const prefix = credit ? (s.creditPrefix || 'RK') : (s.invoicePrefix || 'RE');
       const seq = await nextCounter(env, `${prefix}-${year}`);
-      const number = `${prefix}-${year}-${String(seq).padStart(4, '0')}`;
+      const number = `${env.IS_DEV ? 'DEV-' : ''}${prefix}-${year}-${String(seq).padStart(4, '0')}`;
       data.seller = s; // seller data as printed on the invoice
       await env.DB.prepare(`UPDATE invoices SET number=?, status='open', data=?, total=?, issue_date=?, due_date=?, finalized_at=?, updated_at=? WHERE id=?`)
         .bind(number, JSON.stringify(data), Number(b.total) || row.total, data.issueDate, data.dueDate || null, now(), now(), id).run();
@@ -221,10 +222,8 @@ export async function handleInvoices(request, env, url, json) {
       const obj = await env.DELIVERIES.get(row.pdf_key);
       const attachments = [{ filename: `${row.type === 'credit' ? 'Rechnungskorrektur' : 'Rechnung'}_${row.number}.pdf`, content: toBase64(await obj.arrayBuffer()) }];
       if (b.xml) attachments.push({ filename: `${row.number}_xrechnung.xml`, content: btoa(unescape(encodeURIComponent(b.xml))) });
-      const res = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      try {
+        await sendMail(env, {
           from: `${s.company || 'Dotiy'} <hello@dotiy.de>`,
           to,
           cc: b.cc ? String(b.cc).split(/[,;\s]+/).filter(Boolean) : undefined,
@@ -233,11 +232,10 @@ export async function handleInvoices(request, env, url, json) {
           html: mail.html,
           text: mail.text,
           attachments,
-        }),
-      });
-      if (!res.ok) return json({ error: `E-Mail-Versand fehlgeschlagen: ${await res.text()}` }, 502);
+        });
+      } catch (e) { return json({ error: e.message }, 502); }
       await env.DB.prepare('UPDATE invoices SET sent_at=?, sent_to=?, updated_at=? WHERE id=?').bind(now(), to.join(', '), now(), id).run();
-      await logEvent(env, id, 'sent', `${to.join(', ')}${b.payLinkEnabled ? ' · mit Bezahl-Link' : ''}`);
+      await logEvent(env, id, 'sent', `${env.IS_DEV ? `${env.DEV_EMAIL || 'dev@dotiy.de'} (Entwicklermodus, statt ${to.join(', ')})` : to.join(', ')}${b.payLinkEnabled ? ' · mit Bezahl-Link' : ''}`);
       return json(invoiceOut(await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(id).first()));
     }
 

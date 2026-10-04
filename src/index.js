@@ -1,22 +1,35 @@
 import { handleInvoices } from './invoices.js';
+import { handleDev, devEnv } from './dev.js';
+import { sendMail } from './mail.js';
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, rawEnv) {
     const url    = new URL(request.url);
     const path   = url.pathname;
     const method = request.method;
 
+    // Developer mode: admin calls with X-Dotiy-Mode: dev, sandbox download tokens (dev_…)
+    // and sandbox files (/assets/dev/…) use the sandbox DB + bucket. Public website reads
+    // (cases, posts) never switch, so sandbox content can't be published.
+    const publicSiteRead = method === 'GET' && (path === '/api/cases' || path === '/api/posts' || /^\/api\/posts\/[^/]+$/.test(path));
+    const wantsDev = /^\/d\/dev_/.test(path) || path.startsWith('/assets/dev/') ||
+      (request.headers.get('X-Dotiy-Mode') === 'dev' && !publicSiteRead);
+    let env;
+    try { env = wantsDev ? devEnv(rawEnv) : rawEnv; }
+    catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 503, headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } }); }
+
     const cors = {
       'Access-Control-Allow-Origin':  '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Dotiy-Mode',
+      'Access-Control-Expose-Headers': 'X-Dotiy-Mode',
     };
 
     if (method === 'OPTIONS') return new Response(null, { headers: cors });
 
     const json = (data, status = 200) => new Response(JSON.stringify(data), {
       status,
-      headers: { ...cors, 'Content-Type': 'application/json' },
+      headers: { ...cors, 'Content-Type': 'application/json', ...(env.IS_DEV ? { 'X-Dotiy-Mode': 'dev' } : {}) },
     });
 
     const isAdmin = () =>
@@ -207,7 +220,7 @@ export default {
         };
         const mime   = mimeMap[ext] || file.type || 'application/octet-stream';
         const folder = formData.get('folder') || 'uploads';
-        const key    = `${folder}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+        const key    = `${env.IS_DEV ? 'dev/' : ''}${folder}/${Date.now()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
 
         await env.ASSETS.put(key, file.stream(), {
           httpMetadata: { contentType: mime },
@@ -224,7 +237,7 @@ export default {
         if (!file) return json({ error: 'No file' }, 400);
 
         const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-        const key      = `deliveries/${deliveryId}/${safeName}`;
+        const key      = `${env.IS_DEV ? 'dev/' : ''}deliveries/${deliveryId}/${safeName}`;
 
         await env.DELIVERIES.put(key, file.stream(), {
           httpMetadata: { contentType: file.type || 'application/octet-stream' },
@@ -243,7 +256,7 @@ export default {
         }
 
         const id            = crypto.randomUUID();
-        const token         = _generateToken();
+        const token         = (env.IS_DEV ? 'dev_' : '') + _generateToken();
         const password_hash = password ? await _sha256(password) : null;
         const expires_at    = new Date(Date.now() + expires_days * 24 * 60 * 60 * 1000).toISOString();
         const created_at    = new Date().toISOString();
@@ -377,6 +390,9 @@ export default {
         return json({ ok: true });
       }
 
+      const devRes = await handleDev(request, env, rawEnv, url, json);
+      if (devRes) return devRes;
+
       const invoiceRes = await handleInvoices(request, env, url, json);
       if (invoiceRes) return invoiceRes;
 
@@ -462,23 +478,10 @@ async function _sendDeliveryEmail(env, { clientName, clientEmail, token, files, 
 </body>
 </html>`;
 
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: 'Dotiy Studio <hello@dotiy.de>',
-      to:   [clientEmail],
-      subject: `Deine Dateien von Dotiy sind bereit — ${clientName}`,
-      html,
-    }),
+  return sendMail(env, {
+    from: 'Dotiy Studio <hello@dotiy.de>',
+    to:   [clientEmail],
+    subject: `Deine Dateien von Dotiy sind bereit — ${clientName}`,
+    html,
   });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Resend: ${err}`);
-  }
-  return res.json();
 }
