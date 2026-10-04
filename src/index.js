@@ -1,3 +1,5 @@
+import { handleInvoices } from './invoices.js';
+
 export default {
   async fetch(request, env) {
     const url    = new URL(request.url);
@@ -27,10 +29,28 @@ export default {
       if (host === 'dash.dotiy.de') {
         const targetPath = (url.pathname === '/' || url.pathname === '') ? '/admin' : url.pathname;
         const targetUrl  = `https://dotiy.pages.dev${targetPath}${url.search}`;
-        return fetch(new Request(targetUrl, {
-          method:  request.method,
-          headers: { 'user-agent': request.headers.get('user-agent') || '' },
-        }));
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), 20000);
+        try {
+          const res = await fetch(new Request(targetUrl, {
+            method:   request.method,
+            headers:  { 'user-agent': request.headers.get('user-agent') || '' },
+            signal:   ac.signal,
+            redirect: 'manual',
+          }));
+          clearTimeout(timer);
+          return res;
+        } catch (err) {
+          clearTimeout(timer);
+          return new Response(
+            '<!DOCTYPE html><html><head><meta charset="utf-8"><title>Admin — nicht erreichbar</title></head>' +
+            '<body style="font-family:sans-serif;background:#0a0a0a;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;flex-direction:column;gap:12px;">' +
+            '<p style="font-size:1.1rem;opacity:.7">Admin-Panel konnte nicht geladen werden.</p>' +
+            '<p style="font-size:.85rem;opacity:.4">dotiy.pages.dev nicht erreichbar. Bitte kurz warten und neu laden.</p>' +
+            '</body></html>',
+            { status: 503, headers: { ...cors, 'Content-Type': 'text/html;charset=utf-8' } }
+          );
+        }
       }
 
       // ── Public: GET /assets/:key — serve file from R2 (with Range support) ─
@@ -356,6 +376,9 @@ export default {
         await env.DB.prepare('DELETE FROM posts WHERE id = ?').bind(parseInt(postIdMatch[1])).run();
         return json({ ok: true });
       }
+
+      const invoiceRes = await handleInvoices(request, env, url, json);
+      if (invoiceRes) return invoiceRes;
 
       return json({ error: 'Not found' }, 404);
 
