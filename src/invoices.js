@@ -224,7 +224,7 @@ export async function handleInvoices(request, env, url, json) {
       if (b.xml) attachments.push({ filename: `${row.number}_xrechnung.xml`, content: btoa(unescape(encodeURIComponent(b.xml))) });
       try {
         await sendMail(env, {
-          from: `${s.company || 'Dotiy'} <hello@dotiy.de>`,
+          from: `${s.company || 'Dotiy'} <payments@dotiy.de>`,
           to,
           cc: b.cc ? String(b.cc).split(/[,;\s]+/).filter(Boolean) : undefined,
           reply_to: s.email || 'hello@dotiy.de',
