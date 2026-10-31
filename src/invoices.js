@@ -235,7 +235,8 @@ export async function handleInvoices(request, env, url, json) {
         await sendMail(env, {
           from: `${s.company || 'Dotiy'} <payments@dotiy.de>`,
           to,
-          cc: b.cc ? String(b.cc).split(/[,;\s]+/).filter(Boolean) : undefined,
+          // dev@dotiy.de always gets a copy of sent invoices
+          cc: [...new Set([...(b.cc ? String(b.cc).split(/[,;\s]+/).filter(Boolean) : []), env.DEV_EMAIL || 'dev@dotiy.de'])],
           reply_to: s.email || 'hello@dotiy.de',
           subject: mail.subject,
           html: mail.html,
