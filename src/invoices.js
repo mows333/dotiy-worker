@@ -12,7 +12,7 @@ const SETTINGS_DEFAULTS = {
   email: 'hello@dotiy.de', phone: '+49 176 70500118', website: 'dotiy.de',
   taxNumber: '', vatId: '', smallBusiness: false,
   iban: '', bic: '', bank: '', accountHolder: '',
-  paymentDays: 14, invoicePrefix: 'RE', creditPrefix: 'RK', customerPrefix: 'K-',
+  paymentDays: 14, invoicePrefix: 'RE', creditPrefix: 'RK', customerPrefix: 'C',
   payLinkDefault: false, payLinkUrl: '',
   defaultIntro: 'Vielen Dank für deinen Auftrag. Für die folgenden Leistungen stelle ich dir in Rechnung:',
   defaultOutro: 'Bei Fragen zur Rechnung erreichst du mich jederzeit unter hello@dotiy.de.',
@@ -23,6 +23,15 @@ async function getSettings(env) {
   const s = { ...SETTINGS_DEFAULTS };
   for (const r of results) { try { s[r.key] = JSON.parse(r.value); } catch { s[r.key] = r.value; } }
   return s;
+}
+
+// Customer numbers: prefix + 2-digit year + 3-digit sequence per year (e.g. C26005).
+// Derived from existing numbers, so imports and the sandbox can never collide.
+async function nextCustomerNumber(env, prefix) {
+  const head = `${prefix}${String(new Date().getFullYear()).slice(2)}`;
+  const row = await env.DB.prepare('SELECT MAX(CAST(SUBSTR(number, ?) AS INTEGER)) AS n FROM customers WHERE number LIKE ?')
+    .bind(head.length + 1, `${head}%`).first();
+  return `${head}${String((row?.n || 0) + 1).padStart(3, '0')}`;
 }
 
 async function nextCounter(env, name, start = 1) {
@@ -91,7 +100,7 @@ export async function handleInvoices(request, env, url, json) {
     if (!b.name?.trim()) return json({ error: 'Name fehlt' }, 400);
     const s = await getSettings(env);
     const id = uid();
-    const number = `${s.customerPrefix || 'K-'}${await nextCounter(env, 'customer', 1001)}`;
+    const number = await nextCustomerNumber(env, s.customerPrefix ?? 'C');
     await env.DB.prepare(`INSERT INTO customers (id, number, name, contact, email, street, street2, zip, city, country, vat_id, buyer_ref, notes, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .bind(id, number, b.name.trim(), b.contact || null, b.email || null, b.street || null, b.street2 || null, b.zip || null, b.city || null,
