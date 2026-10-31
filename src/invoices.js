@@ -92,7 +92,7 @@ export async function handleInvoices(request, env, url, json) {
     const { results } = await env.DB.prepare(`
       SELECT c.*, (SELECT COUNT(*) FROM invoices i WHERE i.customer_id = c.id AND i.status != 'draft') AS invoice_count,
         (SELECT COALESCE(SUM(total),0) FROM invoices i WHERE i.customer_id = c.id AND i.type = 'invoice' AND i.status IN ('open','paid')) AS revenue
-      FROM customers c ORDER BY c.name COLLATE NOCASE`).all();
+      FROM customers c ORDER BY c.number DESC, c.name COLLATE NOCASE`).all();
     return json(results.map(r => ({ ...customerOut(r), invoiceCount: r.invoice_count, revenue: r.revenue })));
   }
   if (path === '/api/customers' && method === 'POST') {
