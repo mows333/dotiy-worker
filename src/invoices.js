@@ -55,11 +55,19 @@ function invoiceOut(r) {
     ...data, id: r.id, number: r.number, type: r.type, status: overdue ? 'overdue' : r.status, customerId: r.customer_id,
     total: r.total, pdfKey: r.pdf_key, finalizedAt: r.finalized_at, sentAt: r.sent_at, sentTo: r.sent_to, paidAt: r.paid_at,
     relatedId: r.related_id, createdAt: r.created_at, updatedAt: r.updated_at,
+    remindedAt: r.reminded_at ?? null, reminderCount: r.reminder_count ?? 0,
   };
 }
 
 const DATA_FIELDS = ['type', 'taxCase', 'issueDate', 'serviceFrom', 'serviceTo', 'dueDate', 'customer', 'items', 'intro', 'outro', 'payLink', 'orderRef', 'preceding'];
 const pickData = b => Object.fromEntries(DATA_FIELDS.filter(k => b[k] !== undefined).map(k => [k, b[k]]));
+
+// Reminder stats come from the event log, so no schema change is needed.
+const SELECT_INV = `SELECT i.*,
+  (SELECT MAX(at) FROM invoice_events e WHERE e.invoice_id = i.id AND e.type = 'reminder') AS reminded_at,
+  (SELECT COUNT(*) FROM invoice_events e WHERE e.invoice_id = i.id AND e.type = 'reminder') AS reminder_count
+  FROM invoices i`;
+const getInvoice = (env, id) => env.DB.prepare(`${SELECT_INV} WHERE i.id = ?`).bind(id).first();
 
 async function logEvent(env, id, type, detail) {
   await env.DB.prepare('INSERT INTO invoice_events (invoice_id, at, type, detail) VALUES (?, ?, ?, ?)').bind(id, now(), type, detail ?? null).run();
@@ -125,7 +133,7 @@ export async function handleInvoices(request, env, url, json) {
 
   /* ── Invoices ─────────────────────────────────────────────────────────── */
   if (path === '/api/invoices' && method === 'GET') {
-    const { results } = await env.DB.prepare('SELECT * FROM invoices ORDER BY COALESCE(issue_date, created_at) DESC, created_at DESC').all();
+    const { results } = await env.DB.prepare(`${SELECT_INV} ORDER BY COALESCE(i.issue_date, i.created_at) DESC, i.created_at DESC`).all();
     return json(results.map(invoiceOut));
   }
   if (path === '/api/invoices' && method === 'POST') {
@@ -141,7 +149,7 @@ export async function handleInvoices(request, env, url, json) {
 
   if ((m = path.match(/^\/api\/invoices\/([^/]+)(?:\/([a-z-]+))?$/))) {
     const [, id, action] = m;
-    const row = await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(id).first();
+    const row = await getInvoice(env, id);
     if (!row) return json({ error: 'Rechnung nicht gefunden' }, 404);
     const draft = row.status === 'draft';
 
@@ -247,6 +255,49 @@ export async function handleInvoices(request, env, url, json) {
       await env.DB.prepare('UPDATE invoices SET sent_at=?, sent_to=?, updated_at=? WHERE id=?').bind(now(), to.join(', '), now(), id).run();
       await logEvent(env, id, 'sent', `${env.IS_DEV ? `${env.DEV_EMAIL || 'dev@dotiy.de'} (Entwicklermodus, statt ${to.join(', ')})` : to.join(', ')}${b.payLinkEnabled ? ' · mit Bezahl-Link' : ''}`);
       return json(invoiceOut(await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(id).first()));
+    }
+
+    // Payment reminder: same invoice PDF again, friendly text, new deadline. Logged as 'reminder' event.
+    const canRemind = row.type === 'invoice' && row.status === 'open';
+    const reminderOpts = b => {
+      const deadline = /^\d{4}-\d{2}-\d{2}$/.test(b.deadline || '') ? b.deadline : new Date(Date.now() + 7 * 864e5).toISOString().slice(0, 10);
+      return { ...b, reminder: { level: (row.reminder_count || 0) + 1, deadline } };
+    };
+
+    if (action === 'reminder-preview' && method === 'POST') {
+      if (!canRemind) return json({ error: 'Erinnerungen gibt es nur für offene Rechnungen.' }, 409);
+      const b = await request.json();
+      const inv = invoiceOut(row);
+      return json(invoiceEmail(inv, inv.seller || await getSettings(env), reminderOpts(b)));
+    }
+
+    if (action === 'reminder' && method === 'POST') {
+      if (!canRemind) return json({ error: 'Erinnerungen gibt es nur für offene Rechnungen.' }, 409);
+      if (!row.pdf_key) return json({ error: 'PDF ist noch nicht archiviert.' }, 409);
+      if (!env.RESEND_API_KEY) return json({ error: 'RESEND_API_KEY fehlt im Worker.' }, 500);
+      const b = await request.json();
+      const to = String(b.to || '').split(/[,;\s]+/).filter(Boolean);
+      if (!to.length || to.some(t => !/^\S+@\S+\.\S+$/.test(t))) return json({ error: 'Empfänger-E-Mail ist ungültig.' }, 400);
+      const inv = invoiceOut(row);
+      const s = inv.seller || await getSettings(env);
+      const o = reminderOpts(b);
+      const mail = invoiceEmail(inv, s, o);
+      const obj = await env.DELIVERIES.get(row.pdf_key);
+      if (!obj) return json({ error: 'PDF nicht im Archiv' }, 404);
+      try {
+        await sendMail(env, {
+          from: `${s.company || 'Dotiy'} <payments@dotiy.de>`,
+          to,
+          cc: [...new Set([...(b.cc ? String(b.cc).split(/[,;\s]+/).filter(Boolean) : []), env.DEV_EMAIL || 'dev@dotiy.de'])],
+          reply_to: s.email || 'hello@dotiy.de',
+          subject: mail.subject,
+          html: mail.html,
+          text: mail.text,
+          attachments: [{ filename: `Rechnung_${row.number}.pdf`, content: toBase64(await obj.arrayBuffer()) }],
+        });
+      } catch (e) { return json({ error: e.message }, 502); }
+      await logEvent(env, id, 'reminder', `${o.reminder.level}. Erinnerung an ${env.IS_DEV ? `${env.DEV_EMAIL || 'dev@dotiy.de'} (Entwicklermodus, statt ${to.join(', ')})` : to.join(', ')} · Frist ${o.reminder.deadline.split('-').reverse().join('.')}`);
+      return json(invoiceOut(await getInvoice(env, id)));
     }
 
     if (action === 'paid' && method === 'POST') {
