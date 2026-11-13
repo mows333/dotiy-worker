@@ -152,6 +152,8 @@ export async function handleInvoices(request, env, url, json) {
     const row = await getInvoice(env, id);
     if (!row) return json({ error: 'Rechnung nicht gefunden' }, 404);
     const draft = row.status === 'draft';
+    // Imported legacy invoices (sent before the dashboard existed) are view-only: no edits, mails or status changes.
+    if (JSON.parse(row.data).imported && method !== 'GET') return json({ error: 'Importierte Altrechnung – nur Ansicht.' }, 409);
 
     if (!action && method === 'GET') {
       const inv = invoiceOut(row);
