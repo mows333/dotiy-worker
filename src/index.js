@@ -2,6 +2,7 @@ import { handleInvoices } from './invoices.js';
 import { handleDev, devEnv } from './dev.js';
 import { sendMail } from './mail.js';
 import { handleBank, handleBankCallback, syncAll } from './bank.js';
+import { handleReceipts, receiveMail, processReceipts, matchReceipts } from './receipts.js';
 
 export default {
   async fetch(request, rawEnv) {
@@ -429,6 +430,9 @@ export default {
       const bankRes = await handleBank(request, env, url, json);
       if (bankRes) return bankRes;
 
+      const receiptRes = await handleReceipts(request, env, url, json);
+      if (receiptRes) return receiptRes;
+
       return json({ error: 'Not found' }, 404);
 
     } catch (err) {
@@ -436,9 +440,18 @@ export default {
     }
   },
 
-  // Bank sync 3x daily (live data only; the sandbox syncs on demand).
+  // Cron: bank sync 3x daily, receipts every 30 minutes (live data only; the sandbox runs on demand).
   async scheduled(event, rawEnv, ctx) {
-    ctx.waitUntil(syncAll(rawEnv).catch(e => console.error('bank sync', e)));
+    if (event.cron === '*/30 * * * *') {
+      ctx.waitUntil(processReceipts(rawEnv, 3).catch(e => console.error('receipts', e)));
+    } else {
+      ctx.waitUntil(syncAll(rawEnv).then(() => matchReceipts(rawEnv)).catch(e => console.error('bank sync', e)));
+    }
+  },
+
+  // belege@in.dotiy.de → store the raw mail; reading it with AI happens in the next cron run.
+  async email(message, rawEnv) {
+    await receiveMail(message, rawEnv);
   },
 };
 

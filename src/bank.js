@@ -4,6 +4,7 @@
 // synced daily by the cron trigger and on demand. Incoming payments are matched to open invoices,
 // outgoing ones are sorted into business/private with learnable rules.
 import { logEvent } from './invoices.js';
+import { matchReceipts } from './receipts.js';
 
 const EB = 'https://api.enablebanking.com';
 const now = () => new Date().toISOString();
@@ -247,6 +248,7 @@ export async function syncAll(env) {
     }
   }
   out.paid = await rematch(env);
+  out.receipts = await matchReceipts(env);
   return out;
 }
 

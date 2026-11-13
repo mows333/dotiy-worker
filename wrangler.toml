@@ -36,8 +36,12 @@ DEV_EMAIL = "dev@dotiy.de"
 pattern = "dash.dotiy.de/*"
 zone_name = "dotiy.de"
 
+# Workers AI (free daily allocation) for reading receipts
+[ai]
+binding = "AI"
+
 [triggers]
-crons = ["0 5,11,17 * * *"]   # bank sync 3x daily (PSD2 allows max. 4 unattended fetches per day)
+crons = ["0 5,11,17 * * *", "*/30 * * * *"]   # bank sync 3x daily (PSD2: max. 4 unattended fetches/day) · receipts every 30 min
 
 # Secrets — set via Cloudflare Dashboard → Workers → dotiy-api → Settings → Variables
 # ADMIN_SECRET
