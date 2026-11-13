@@ -436,7 +436,7 @@ export default {
     }
   },
 
-  // Daily bank sync (live data only; the sandbox syncs on demand).
+  // Bank sync 3x daily (live data only; the sandbox syncs on demand).
   async scheduled(event, rawEnv, ctx) {
     ctx.waitUntil(syncAll(rawEnv).catch(e => console.error('bank sync', e)));
   },

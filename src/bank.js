@@ -82,15 +82,79 @@ function ruleFor(list, tx) {
   return list.find(r => r.direction === dir && hay.includes(r.match));
 }
 
-/** Incoming payment → open invoice. Strong match (amount + number in purpose) books it as paid. */
-async function matchInvoice(env, tx, open) {
-  const amountHits = open.filter(i => Math.abs(i.total - tx.amount) < 0.01);
-  const hay = norm(`${tx.purpose} ${tx.counterparty}`).replace(/\s+/g, '');
-  const byNumber = open.find(i => i.number && hay.includes(norm(i.number)));
-  if (byNumber && amountHits.includes(byNumber)) return { invoice: byNumber, sure: true };
-  if (byNumber) return { invoice: byNumber, sure: false };
-  if (amountHits.length === 1) return { invoice: amountHits[0], sure: false };
+// Incoming payment → open invoice.
+const alnum = s => norm(s).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/ß/g, 'ss').replace(/[^a-z0-9]/g, '');
+const LEGAL = new Set(['gmbh', 'mbh', 'ug', 'ag', 'kg', 'ohg', 'gbr', 'ek', 'ev', 'co', 'und', 'the', 'ltd', 'llc', 'inc', 'limited', 'haftungsbeschraenkt', 'services', 'service', 'group', 'gruppe', 'herr', 'frau', 'firma']);
+const nameTokens = name => norm(name).normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/ß/g, 'ss').split(/[^a-z0-9]+/).filter(t => t.length >= 3 && !LEGAL.has(t));
+
+async function invoicesFor(env, status) {
+  const { results } = await env.DB.prepare(
+    `SELECT i.id, i.number, i.total, i.issue_date, i.paid_at, i.data, c.name AS cname FROM invoices i LEFT JOIN customers c ON c.id = i.customer_id
+     WHERE i.type = 'invoice' AND i.status = ? ${status === 'paid' ? 'AND NOT EXISTS (SELECT 1 FROM bank_tx t WHERE t.invoice_id = i.id AND t.kind = \'income\')' : ''}
+     ORDER BY i.due_date, i.number`
+  ).bind(status).all();
+  return results.map(r => {
+    let name = r.cname;
+    try { name = name || JSON.parse(r.data).customer?.name; } catch {}
+    return { id: r.id, number: r.number, total: r.total, issue: r.issue_date, paidAt: r.paid_at, name: name || '', tokens: nameTokens(name || ''), num: alnum(r.number) };
+  });
+}
+
+/**
+ * sure  = amount matches and (invoice number in the purpose or payer name matches the customer) → booked as paid.
+ * guess = only one of those signals → shown as a one-click suggestion.
+ */
+export function matchInvoice(tx, list, paid = false) {
+  // Open invoices: only payments from 7 days before the invoice date on.
+  // Already paid invoices (history): payment within 45 days of the recorded paid date.
+  const day = d => new Date(`${(d || '').slice(0, 10)}T00:00:00Z`).getTime() / DAY;
+  const open = list.filter(i => paid
+    ? i.paidAt && Math.abs(day(tx.booking_date) - day(i.paidAt)) <= 45
+    : !i.issue || day(tx.booking_date) >= day(i.issue) - 7);
+  const hay = alnum(`${tx.purpose || ''} ${tx.counterparty || ''}`);
+  const payer = new Set(nameTokens(`${tx.counterparty || ''} ${tx.purpose || ''}`));
+  const amountOk = i => Math.abs(i.total - tx.amount) < 0.01;
+  const numberOk = i => i.num.length >= 4 && hay.includes(i.num);
+  const nameOk = i => i.tokens.some(t => payer.has(t));
+
+  const byNumber = open.filter(numberOk);
+  const sure = byNumber.find(amountOk) || open.find(i => amountOk(i) && nameOk(i));
+  if (sure) return { invoice: sure, sure: true };
+  if (byNumber.length === 1) return { invoice: byNumber[0], sure: false };
+  const byAmount = open.filter(amountOk);
+  if (byAmount.length === 1) return { invoice: byAmount[0], sure: false };
+  const byName = open.filter(nameOk);
+  if (byName.length === 1) return { invoice: byName[0], sure: false };
   return null;
+}
+
+/** Re-checks every unassigned incoming payment against the open invoices (runs after each sync). */
+export async function rematch(env) {
+  const open = await invoicesFor(env, 'open');
+  const history = await invoicesFor(env, 'paid');
+  const { results } = await env.DB.prepare(
+    "SELECT * FROM bank_tx WHERE amount > 0 AND (kind = 'open' OR (kind = 'income' AND invoice_id IS NULL)) ORDER BY booking_date"
+  ).all();
+  let paid = 0;
+  for (const row of results) {
+    // Payment of an invoice that is already marked as paid → just link it.
+    const h = matchInvoice(row, history, true);
+    if (h?.sure) {
+      await env.DB.prepare("UPDATE bank_tx SET kind = 'income', invoice_id = ?, updated_at = ? WHERE id = ?").bind(h.invoice.id, now(), row.id).run();
+      history.splice(history.indexOf(h.invoice), 1);
+      continue;
+    }
+    const m = matchInvoice(row, open);
+    if (!m) continue;
+    if (m.sure && await markPaid(env, m.invoice.id, row.booking_date, row)) {
+      await env.DB.prepare("UPDATE bank_tx SET kind = 'income', invoice_id = ?, updated_at = ? WHERE id = ?").bind(m.invoice.id, now(), row.id).run();
+      open.splice(open.indexOf(m.invoice), 1);
+      paid++;
+    } else if (!m.sure && row.kind === 'open' && row.invoice_id !== m.invoice.id) {
+      await env.DB.prepare('UPDATE bank_tx SET invoice_id = ?, updated_at = ? WHERE id = ?').bind(m.invoice.id, now(), row.id).run();
+    }
+  }
+  return paid;
 }
 
 async function markPaid(env, invoiceId, date, tx) {
@@ -139,34 +203,20 @@ async function syncAccount(env, acc) {
   } while (key && ++pages < 30);
 
   const list = await rules(env);
-  const open = (await env.DB.prepare("SELECT id, number, total FROM invoices WHERE type = 'invoice' AND status = 'open'").all()).results;
-  let added = 0, paid = 0;
+  let added = 0;
   const stamp = now();
   const stmts = [];
   for (const t of fetched) {
     if (t.status && t.status !== 'BOOK') continue;
     const id = await txId(acc.uid, t);
     const tx = mapTx(t);
-    let kind = 'open', category = null, invoiceId = null, ruleId = null;
+    let kind = 'open', category = null, ruleId = null;
     const rule = ruleFor(list, tx);
     if (rule) { kind = rule.kind; category = rule.category; ruleId = rule.id; }
-    if (tx.amount > 0 && kind !== 'private' && kind !== 'transfer') {
-      const m = await matchInvoice(env, tx, open);
-      if (m) {
-        invoiceId = m.invoice.id;
-        if (m.sure) {
-          const exists = await env.DB.prepare('SELECT 1 FROM bank_tx WHERE id = ?').bind(id).first();
-          if (!exists && await markPaid(env, m.invoice.id, tx.booking_date, tx)) {
-            kind = 'income'; paid++;
-            open.splice(open.indexOf(m.invoice), 1);
-          }
-        }
-      }
-    }
     stmts.push(env.DB.prepare(
       `INSERT OR IGNORE INTO bank_tx (id, account_uid, booking_date, amount, currency, counterparty, purpose, kind, category, invoice_id, rule_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(id, acc.uid, tx.booking_date, tx.amount, tx.currency, tx.counterparty, tx.purpose, kind, category, invoiceId, ruleId, stamp, stamp));
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`
+    ).bind(id, acc.uid, tx.booking_date, tx.amount, tx.currency, tx.counterparty, tx.purpose, kind, category, ruleId, stamp, stamp));
   }
   for (let i = 0; i < stmts.length; i += 50) {
     const res = await env.DB.batch(stmts.slice(i, i + 50));
@@ -180,7 +230,7 @@ async function syncAccount(env, acc) {
     if (pick) balance = parseFloat(pick.balance_amount.amount);
   } catch {}
   await env.DB.prepare('UPDATE bank_accounts SET last_sync = ?, last_error = NULL, balance = ? WHERE uid = ?').bind(now(), balance, acc.uid).run();
-  return { added, paid };
+  return { added };
 }
 
 export async function syncAll(env) {
@@ -190,12 +240,13 @@ export async function syncAll(env) {
     if (acc.valid_until && acc.valid_until < now()) { out.errors.push(`${acc.name || acc.iban}: Freigabe abgelaufen`); continue; }
     try {
       const r = await syncAccount(env, acc);
-      out.added += r.added; out.paid += r.paid;
+      out.added += r.added;
     } catch (e) {
       await env.DB.prepare('UPDATE bank_accounts SET last_error = ? WHERE uid = ?').bind(e.message, acc.uid).run();
       out.errors.push(`${acc.name || acc.iban}: ${e.message}`);
     }
   }
+  out.paid = await rematch(env);
   return out;
 }
 
