@@ -301,12 +301,14 @@ export async function classifyOpen(env, batches = 2) {
   ).all();
   const examples = done.map(e => `${e.counterparty} (${e.amount < 0 ? 'Ausgabe' : 'Eingang'}) → ${e.kind}${e.category ? `/${e.category}` : ''}`).join('\n');
 
-  let sorted = 0, checked = 0;
-  for (let b = 0; b < batches; b++) {
-    const { results: rows } = await env.DB.prepare(
-      "SELECT * FROM bank_tx WHERE kind = 'open' AND invoice_id IS NULL AND ai_checked IS NULL ORDER BY booking_date DESC LIMIT ?"
-    ).bind(AI_BATCH).all();
-    if (!rows.length) break;
+  // `batches` packages of AI_BATCH rows are sent to the AI at the same time (wall time ≈ one call).
+  const { results: all } = await env.DB.prepare(
+    "SELECT * FROM bank_tx WHERE kind = 'open' AND invoice_id IS NULL AND ai_checked IS NULL ORDER BY booking_date DESC LIMIT ?"
+  ).bind(AI_BATCH * batches).all();
+  const chunks = [];
+  for (let i = 0; i < all.length; i += AI_BATCH) chunks.push(all.slice(i, i + AI_BATCH));
+
+  const runChunk = async rows => {
     const list = rows.map((t, i) => `${i + 1}. ${t.booking_date} | ${t.amount.toFixed(2)} ${t.currency} | ${t.counterparty || '—'} | ${(t.purpose || '').slice(0, 80)}`).join('\n');
     const res = await env.AI.run(AI_MODEL, {
       messages: [
@@ -318,24 +320,32 @@ export async function classifyOpen(env, batches = 2) {
       temperature: 0,
     });
     const parsed = typeof res.response === 'string' ? JSON.parse(res.response) : res.response;
-    const byN = new Map((parsed?.items || []).map(x => [x.n, x]));
-    const stamp = now();
-    const stmts = rows.map((t, i) => {
-      const x = byN.get(i + 1);
+    return new Map((parsed?.items || []).map(x => [x.n, x]));
+  };
+  const results = await Promise.allSettled(chunks.map(runChunk));
+
+  let sorted = 0, checked = 0;
+  const stamp = now();
+  const stmts = [];
+  results.forEach((r, c) => {
+    if (r.status !== 'fulfilled') return; // failed package: rows stay unchecked and are retried
+    chunks[c].forEach((t, i) => {
+      const x = r.value.get(i + 1);
       const valid = x && x.confidence >= AI_MIN_CONFIDENCE && (x.kind !== 'income' || t.amount > 0) && (x.kind !== 'business' || t.amount < 0)
         && (x.kind !== 'business' || CATEGORY_KEYS.includes(x.category));
+      checked++;
       if (valid) {
         sorted++;
-        return env.DB.prepare("UPDATE bank_tx SET kind = ?, category = ?, rule_id = 'ai', ai_checked = ?, updated_at = ? WHERE id = ? AND kind = 'open'")
-          .bind(x.kind, x.kind === 'business' ? x.category : null, stamp, stamp, t.id);
-      }
-      return env.DB.prepare('UPDATE bank_tx SET ai_checked = ? WHERE id = ?').bind(stamp, t.id);
+        stmts.push(env.DB.prepare("UPDATE bank_tx SET kind = ?, category = ?, rule_id = 'ai', ai_checked = ?, updated_at = ? WHERE id = ? AND kind = 'open'")
+          .bind(x.kind, x.kind === 'business' ? x.category : null, stamp, stamp, t.id));
+      } else stmts.push(env.DB.prepare('UPDATE bank_tx SET ai_checked = ? WHERE id = ?').bind(stamp, t.id));
     });
-    await env.DB.batch(stmts);
-    checked += rows.length;
-  }
+  });
+  for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+  const failed = results.find(r => r.status === 'rejected');
+  if (failed && !checked) throw failed.reason;
   const rest = await env.DB.prepare("SELECT COUNT(*) AS n FROM bank_tx WHERE kind = 'open' AND invoice_id IS NULL AND ai_checked IS NULL").first();
-  return { sorted, checked, remaining: rest.n };
+  return { sorted, checked, remaining: rest.n, open: (await env.DB.prepare("SELECT COUNT(*) AS n FROM bank_tx WHERE kind = 'open'").first()).n };
 }
 
 /* ── Output ──────────────────────────────────────────────────────────── */
@@ -428,7 +438,8 @@ export async function handleBank(request, env, url, json, ctx) {
     const b = await request.json().catch(() => ({}));
     // "Alle erneut prüfen": uncertain ones that were skipped before get another look.
     if (b.again) await env.DB.prepare("UPDATE bank_tx SET ai_checked = NULL WHERE kind = 'open'").run();
-    return json(await classifyOpen(env, 2));
+    try { return json(await classifyOpen(env, 3)); }
+    catch (e) { return json({ error: `KI-Sortierung fehlgeschlagen: ${e.message}` }, 502); }
   }
 
   if ((m = path.match(/^\/api\/bank\/accounts\/([^/]+)$/)) && method === 'DELETE') {
