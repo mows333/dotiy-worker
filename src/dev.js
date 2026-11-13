@@ -6,7 +6,7 @@ export function devEnv(env) {
   return { ...env, DB: env.DB_DEV, ASSETS: env.DEV_BUCKET, DELIVERIES: env.DEV_BUCKET, LIVE_DB: env.DB, IS_DEV: true };
 }
 
-const SANDBOX_TABLES = ['invoice_events', 'invoices', 'customers', 'counters', 'settings', 'deliveries', 'cases', 'posts'];
+const SANDBOX_TABLES = ['invoice_events', 'invoices', 'customers', 'counters', 'settings', 'deliveries', 'looms', 'cases', 'posts'];
 const COPY_TABLES = ['settings', 'customers', 'cases', 'posts'];
 
 export async function handleDev(request, env, rawEnv, url, json) {

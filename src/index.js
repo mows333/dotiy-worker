@@ -249,7 +249,7 @@ export default {
       // ── Admin: POST /api/deliver — create delivery + send email ─────────
       if (path === '/api/deliver' && method === 'POST') {
         const b = await request.json();
-        const { client_name, client_email, files, password, message, expires_days = 14 } = b;
+        const { client_name, client_email, files, password, message, expires_days = 14, customer_id } = b;
 
         if (!client_name || !client_email || !files?.length) {
           return json({ error: 'client_name, client_email und files sind Pflichtfelder' }, 400);
@@ -263,9 +263,9 @@ export default {
         const filesJson     = JSON.stringify(files);
 
         await env.DB.prepare(
-          `INSERT INTO deliveries (id, token, client_name, client_email, files, password_hash, message, expires_at, download_count, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
-        ).bind(id, token, client_name, client_email, filesJson, password_hash, message ?? null, expires_at, created_at).run();
+          `INSERT INTO deliveries (id, token, client_name, client_email, files, password_hash, message, expires_at, download_count, created_at, customer_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`
+        ).bind(id, token, client_name, client_email, filesJson, password_hash, message ?? null, expires_at, created_at, customer_id || null).run();
 
         await _sendDeliveryEmail(env, {
           clientName: client_name, clientEmail: client_email,
@@ -280,7 +280,7 @@ export default {
       if (path === '/api/delivers' && method === 'GET') {
         const { results } = await env.DB.prepare(
           `SELECT id, token, client_name, client_email, files, message,
-           expires_at, download_count, created_at,
+           expires_at, download_count, created_at, customer_id,
            (password_hash IS NOT NULL) as has_password
            FROM deliveries ORDER BY created_at DESC`
         ).all();
@@ -312,6 +312,29 @@ export default {
           'UPDATE deliveries SET expires_at = ? WHERE id = ?'
         ).bind(expires_at, deliverIdMatch[1]).run();
         return json({ ok: true, expires_at });
+      }
+
+      // ── Admin: Loom links (saved so they show up on the customer page) ──
+      if (path === '/api/looms' && method === 'GET') {
+        const customer = url.searchParams.get('customer');
+        const q = customer
+          ? env.DB.prepare('SELECT * FROM looms WHERE customer_id = ? ORDER BY created_at DESC').bind(customer)
+          : env.DB.prepare('SELECT * FROM looms ORDER BY created_at DESC');
+        const { results } = await q.all();
+        return json(results);
+      }
+      if (path === '/api/looms' && method === 'POST') {
+        const b = await request.json();
+        if (!b.name?.trim() || !b.video?.trim() || !/^https:\/\//.test(b.url || '')) return json({ error: 'Name, Video und Link sind Pflicht' }, 400);
+        const row = { id: crypto.randomUUID(), customer_id: b.customer_id || null, name: b.name.trim(), video: b.video.trim(), gif: b.gif?.trim() || null, url: b.url, created_at: new Date().toISOString() };
+        await env.DB.prepare('INSERT INTO looms (id, customer_id, name, video, gif, url, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+          .bind(row.id, row.customer_id, row.name, row.video, row.gif, row.url, row.created_at).run();
+        return json(row);
+      }
+      const loomIdMatch = path.match(/^\/api\/looms\/([^/]+)$/);
+      if (loomIdMatch && method === 'DELETE') {
+        await env.DB.prepare('DELETE FROM looms WHERE id = ?').bind(loomIdMatch[1]).run();
+        return json({ ok: true });
       }
 
       // ── Admin: GET /api/admin/cases ─────────────────────────────────────

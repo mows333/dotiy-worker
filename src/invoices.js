@@ -42,7 +42,7 @@ async function nextCounter(env, name, start = 1) {
 }
 
 const customerOut = c => c && ({
-  id: c.id, number: c.number, name: c.name, contact: c.contact, email: c.email, street: c.street, street2: c.street2,
+  id: c.id, number: c.number, name: c.name, contact: c.contact, email: c.email, phone: c.phone, street: c.street, street2: c.street2,
   zip: c.zip, city: c.city, country: c.country, vatId: c.vat_id, buyerRef: c.buyer_ref, notes: c.notes, createdAt: c.created_at,
 });
 
@@ -109,17 +109,17 @@ export async function handleInvoices(request, env, url, json) {
     const s = await getSettings(env);
     const id = uid();
     const number = await nextCustomerNumber(env, s.customerPrefix ?? 'C');
-    await env.DB.prepare(`INSERT INTO customers (id, number, name, contact, email, street, street2, zip, city, country, vat_id, buyer_ref, notes, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(id, number, b.name.trim(), b.contact || null, b.email || null, b.street || null, b.street2 || null, b.zip || null, b.city || null,
+    await env.DB.prepare(`INSERT INTO customers (id, number, name, contact, email, phone, street, street2, zip, city, country, vat_id, buyer_ref, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(id, number, b.name.trim(), b.contact || null, b.email || null, b.phone || null, b.street || null, b.street2 || null, b.zip || null, b.city || null,
         (b.country || 'DE').toUpperCase(), b.vatId || null, b.buyerRef || null, b.notes || null, now(), now()).run();
     return json(customerOut(await env.DB.prepare('SELECT * FROM customers WHERE id = ?').bind(id).first()));
   }
   if ((m = path.match(/^\/api\/customers\/([^/]+)$/))) {
     if (method === 'PUT') {
       const b = await request.json();
-      await env.DB.prepare(`UPDATE customers SET name=?, contact=?, email=?, street=?, street2=?, zip=?, city=?, country=?, vat_id=?, buyer_ref=?, notes=?, updated_at=? WHERE id=?`)
-        .bind(b.name, b.contact || null, b.email || null, b.street || null, b.street2 || null, b.zip || null, b.city || null,
+      await env.DB.prepare(`UPDATE customers SET name=?, contact=?, email=?, phone=?, street=?, street2=?, zip=?, city=?, country=?, vat_id=?, buyer_ref=?, notes=?, updated_at=? WHERE id=?`)
+        .bind(b.name, b.contact || null, b.email || null, b.phone || null, b.street || null, b.street2 || null, b.zip || null, b.city || null,
           (b.country || 'DE').toUpperCase(), b.vatId || null, b.buyerRef || null, b.notes || null, now(), m[1]).run();
       return json(customerOut(await env.DB.prepare('SELECT * FROM customers WHERE id = ?').bind(m[1]).first()));
     }
