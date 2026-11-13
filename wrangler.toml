@@ -36,6 +36,10 @@ DEV_EMAIL = "dev@dotiy.de"
 pattern = "dash.dotiy.de/*"
 zone_name = "dotiy.de"
 
+[triggers]
+crons = ["0 5 * * *"]   # daily bank sync (05:00 UTC)
+
 # Secrets — set via Cloudflare Dashboard → Workers → dotiy-api → Settings → Variables
 # ADMIN_SECRET
 # RESEND_API_KEY
+# EB_APP_ID, EB_PRIVATE_KEY   (Enable Banking application id + PEM private key)

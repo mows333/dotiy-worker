@@ -1,6 +1,7 @@
 import { handleInvoices } from './invoices.js';
 import { handleDev, devEnv } from './dev.js';
 import { sendMail } from './mail.js';
+import { handleBank, handleBankCallback, syncAll } from './bank.js';
 
 export default {
   async fetch(request, rawEnv) {
@@ -201,6 +202,12 @@ export default {
         headers.set('Content-Disposition', `attachment; filename="${fileInfo.name}"`);
         if (obj.size) headers.set('Content-Length', String(obj.size));
         return new Response(obj.body, { headers });
+      }
+
+      // ── Public: GET /api/bank/callback — the bank redirects the browser back here ──
+      if (path === '/api/bank/callback' && method === 'GET') {
+        const devState = (url.searchParams.get('state') || '').startsWith('dev.');
+        return handleBankCallback(request, devState ? devEnv(rawEnv) : rawEnv, url);
       }
 
       // ── All routes below require admin auth ────────────────────────────
@@ -419,11 +426,19 @@ export default {
       const invoiceRes = await handleInvoices(request, env, url, json);
       if (invoiceRes) return invoiceRes;
 
+      const bankRes = await handleBank(request, env, url, json);
+      if (bankRes) return bankRes;
+
       return json({ error: 'Not found' }, 404);
 
     } catch (err) {
       return json({ error: err.message }, 500);
     }
+  },
+
+  // Daily bank sync (live data only; the sandbox syncs on demand).
+  async scheduled(event, rawEnv, ctx) {
+    ctx.waitUntil(syncAll(rawEnv).catch(e => console.error('bank sync', e)));
   },
 };
 

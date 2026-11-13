@@ -69,7 +69,7 @@ const SELECT_INV = `SELECT i.*,
   FROM invoices i`;
 const getInvoice = (env, id) => env.DB.prepare(`${SELECT_INV} WHERE i.id = ?`).bind(id).first();
 
-async function logEvent(env, id, type, detail) {
+export async function logEvent(env, id, type, detail) {
   await env.DB.prepare('INSERT INTO invoice_events (invoice_id, at, type, detail) VALUES (?, ?, ?, ?)').bind(id, now(), type, detail ?? null).run();
 }
 
