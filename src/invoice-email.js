@@ -6,12 +6,15 @@ const dateDE = iso => (iso ? iso.split('-').reverse().join('.') : '');
 
 export function invoiceEmail(inv, s, opts = {}) {
   const credit = inv.type === 'credit';
-  const kind = credit ? 'Rechnungskorrektur' : 'Rechnung';
-  const rem = !credit && opts.reminder ? opts.reminder : null;
+  const offer = inv.type === 'offer';
+  const order = inv.type === 'order';
+  const quote = offer || order; // no payment in the mail, no e-invoice
+  const kind = { credit: inv.fullCancel ? 'Stornorechnung' : 'Rechnungskorrektur', offer: 'Angebot', order: 'Auftragsbestätigung' }[inv.type] || 'Rechnung';
+  const rem = inv.type === 'invoice' && opts.reminder ? opts.reminder : null;
   const remLabel = rem ? `${rem.level > 1 ? `${rem.level}. ` : ''}Zahlungserinnerung` : '';
   const payBy = rem?.deadline || inv.dueDate;
   const payUrl = opts.payLinkEnabled ?? inv.payLink?.enabled ? (opts.payLinkUrl || inv.payLink?.url) : '';
-  const pay = !credit && /^https:\/\//.test(payUrl || '');
+  const pay = !credit && !quote && /^https:\/\//.test(payUrl || '');
   const greeting = inv.customer?.contact ? `Hallo ${inv.customer.contact.split(' ')[0]},` : 'Hallo,';
   const message = (opts.message ?? '').trim();
   const subject = opts.subject || (rem ? `${remLabel}: Rechnung ${inv.number}` : `${kind} ${inv.number} von ${s.company || 'Dotiy'}`);
@@ -21,8 +24,12 @@ export function invoiceEmail(inv, s, opts = {}) {
     ? esc(message).replace(/\n/g, '<br>')
     : rem
       ? `sicher ist es im Alltag untergegangen: Die Rechnung ${esc(inv.number)} vom ${dateDE(inv.issueDate)} über <b>${amount}</b> war am ${dateDE(inv.dueDate)} fällig, und ich konnte noch keinen Zahlungseingang finden.<br><br>Falls du bereits bezahlt hast, betrachte diese E-Mail einfach als gegenstandslos.`
+      : offer
+      ? `vielen Dank für deine Anfrage! Anbei findest du mein Angebot ${esc(inv.number)} über <b>${amount}</b>${inv.validUntil ? `, gültig bis ${dateDE(inv.validUntil)}` : ''}.<br><br>Wenn alles passt, antworte einfach auf diese E-Mail – dann geht's los. Bei Fragen melde dich jederzeit.`
+      : order
+      ? `vielen Dank für deinen Auftrag! Anbei die Auftragsbestätigung ${esc(inv.number)} über <b>${amount}</b>${inv.basedOn?.number ? ` zu meinem Angebot ${esc(inv.basedOn.number)}` : ''}. Darin stehen alle vereinbarten Leistungen und Konditionen.`
       : credit
-      ? `anbei erhältst du die ${kind} ${esc(inv.number)} zur Rechnung ${esc(inv.preceding?.number || '')}.`
+      ? `anbei erhältst du die ${kind} ${esc(inv.number)} zur Rechnung ${esc(inv.preceding?.number || '')}. ${inv.originalPaid ? 'Den Betrag erstatte ich dir in den nächsten Tagen.' : 'Damit ist die Rechnung ausgeglichen, du musst nichts weiter tun.'}`
       : `anbei erhältst du die Rechnung ${esc(inv.number)} über <b>${amount}</b>. Vielen Dank für deinen Auftrag!`;
 
   const row = (k, v) => `<tr><td style="padding:6px 0;color:#6b6b6f;font-size:14px;">${k}</td><td style="padding:6px 0;text-align:right;font-size:14px;font-weight:600;color:#111;">${v}</td></tr>`;
@@ -34,7 +41,7 @@ export function invoiceEmail(inv, s, opts = {}) {
       ${row('Verwendungszweck', esc(inv.number))}
     </table>`;
 
-  const payBlock = credit ? '' : pay ? `
+  const payBlock = credit || quote ? '' : pay ? `
     <table role="presentation" width="100%" style="margin:28px 0 8px;"><tr><td align="center">
       <a href="${esc(payUrl)}" style="display:inline-block;background:#111;color:#fff;text-decoration:none;font-weight:700;font-size:16px;padding:16px 34px;border-radius:999px;">Jetzt ${amount} bezahlen</a>
     </td></tr></table>
@@ -63,14 +70,15 @@ export function invoiceEmail(inv, s, opts = {}) {
         <p style="margin:0 0 16px;font-size:15px;line-height:1.6;">${greeting}</p>
         <p style="margin:0;font-size:15px;line-height:1.6;">${intro}</p>
         <table role="presentation" width="100%" style="border-collapse:collapse;margin-top:24px;border-top:1px solid #eee;">
-          ${row(`${kind}s-Nr.`, esc(inv.number))}
+          ${row(quote ? 'Nummer' : `${kind}s-Nr.`, esc(inv.number))}
           ${row('Datum', dateDE(inv.issueDate))}
-          ${credit ? '' : row(rem ? 'Ursprünglich fällig' : 'Fällig am', dateDE(inv.dueDate))}
+          ${offer && inv.validUntil ? row('Gültig bis', dateDE(inv.validUntil)) : ''}
+          ${credit || quote ? '' : row(rem ? 'Ursprünglich fällig' : 'Fällig am', dateDE(inv.dueDate))}
           ${rem ? row('Neue Frist', dateDE(payBy)) : ''}
           ${row('Betrag', amount)}
         </table>
         ${payBlock}
-        <p style="margin:28px 0 0;font-size:13px;line-height:1.6;color:#6b6b6f;">${rem ? 'Die Rechnung hängt noch einmal als PDF an.' : `Die ${kind} hängt als PDF an.`} Sie ist eine E-Rechnung im ZUGFeRD-Format (EN 16931) und kann direkt in Buchhaltungssoftware übernommen werden.</p>
+        <p style="margin:28px 0 0;font-size:13px;line-height:1.6;color:#6b6b6f;">${rem ? 'Die Rechnung hängt noch einmal als PDF an.' : `${offer ? 'Das' : 'Die'} ${kind} hängt als PDF an.`}${quote ? '' : ' Sie ist eine E-Rechnung im ZUGFeRD-Format (EN 16931) und kann direkt in Buchhaltungssoftware übernommen werden.'}</p>
         <p style="margin:24px 0 0;font-size:15px;line-height:1.6;">Viele Grüße<br>${esc(s.owner || s.company)}</p>
       </td></tr>
     </table>
@@ -80,9 +88,9 @@ export function invoiceEmail(inv, s, opts = {}) {
 
   const text = [
     greeting, '',
-    message || (rem ? `die Rechnung ${inv.number} vom ${dateDE(inv.issueDate)} über ${amount} war am ${dateDE(inv.dueDate)} fällig, und ich konnte noch keinen Zahlungseingang finden. Falls du bereits bezahlt hast, betrachte diese E-Mail als gegenstandslos.` : credit ? `anbei erhältst du die ${kind} ${inv.number}.` : `anbei erhältst du die Rechnung ${inv.number} über ${amount}.`), '',
-    credit ? '' : (pay ? `Jetzt bezahlen: ${payUrl}\n\nOder per Überweisung bis ${dateDE(payBy)}:` : `Bitte überweise ${amount} bis zum ${dateDE(payBy)}:`),
-    credit ? '' : `Empfänger: ${s.accountHolder || s.owner || s.company}\nIBAN: ${s.iban}${s.bic ? `\nBIC: ${s.bic}` : ''}\nVerwendungszweck: ${inv.number}`,
+    message || (offer ? `vielen Dank für deine Anfrage! Anbei mein Angebot ${inv.number} über ${amount}${inv.validUntil ? `, gültig bis ${dateDE(inv.validUntil)}` : ''}. Wenn alles passt, antworte einfach auf diese E-Mail.` : order ? `vielen Dank für deinen Auftrag! Anbei die Auftragsbestätigung ${inv.number} über ${amount}.` : rem ? `die Rechnung ${inv.number} vom ${dateDE(inv.issueDate)} über ${amount} war am ${dateDE(inv.dueDate)} fällig, und ich konnte noch keinen Zahlungseingang finden. Falls du bereits bezahlt hast, betrachte diese E-Mail als gegenstandslos.` : credit ? `anbei erhältst du die ${kind} ${inv.number}.` : `anbei erhältst du die Rechnung ${inv.number} über ${amount}.`), '',
+    credit || quote ? '' : (pay ? `Jetzt bezahlen: ${payUrl}\n\nOder per Überweisung bis ${dateDE(payBy)}:` : `Bitte überweise ${amount} bis zum ${dateDE(payBy)}:`),
+    credit || quote ? '' : `Empfänger: ${s.accountHolder || s.owner || s.company}\nIBAN: ${s.iban}${s.bic ? `\nBIC: ${s.bic}` : ''}\nVerwendungszweck: ${inv.number}`,
     '', `Viele Grüße\n${s.owner || s.company}`,
   ].join('\n');
 

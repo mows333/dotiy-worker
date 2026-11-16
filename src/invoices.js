@@ -12,7 +12,7 @@ const SETTINGS_DEFAULTS = {
   email: 'hello@dotiy.de', phone: '+49 176 70500118', website: 'dotiy.de',
   taxNumber: '', vatId: '', smallBusiness: false,
   iban: '', bic: '', bank: '', accountHolder: '',
-  paymentDays: 14, invoicePrefix: 'RE', creditPrefix: 'RK', customerPrefix: 'C',
+  paymentDays: 14, invoicePrefix: 'RE', creditPrefix: 'RK', customerPrefix: 'C', offerPrefix: 'AN', orderPrefix: 'AB', offerValidDays: 30,
   payLinkDefault: false, payLinkUrl: '',
   defaultIntro: 'Vielen Dank für deinen Auftrag. Für die folgenden Leistungen stelle ich dir in Rechnung:',
   defaultOutro: 'Bei Fragen zur Rechnung erreichst du mich jederzeit unter hello@dotiy.de.',
@@ -46,26 +46,43 @@ const customerOut = c => c && ({
   zip: c.zip, city: c.city, country: c.country, vatId: c.vat_id, buyerRef: c.buyer_ref, notes: c.notes, createdAt: c.created_at,
 });
 
+// Document types: invoice, credit (Rechnungskorrektur/Storno), offer (Angebot), order (Auftragsbestätigung).
+// Offers and order confirmations share numbering, freezing (GoBD) and archiving with invoices.
+export const DOC = {
+  invoice: { label: 'Rechnung', prefix: s => s.invoicePrefix || 'RE' },
+  credit: { label: 'Rechnungskorrektur', prefix: s => s.creditPrefix || 'RK' },
+  offer: { label: 'Angebot', prefix: s => s.offerPrefix || 'AN' },
+  order: { label: 'Auftragsbestätigung', prefix: s => s.orderPrefix || 'AB' },
+};
+const QUOTES = ['offer', 'order'];
+const ORDER_INTRO = 'Vielen Dank für deinen Auftrag! Hiermit bestätige ich die folgenden Leistungen zu den genannten Konditionen:';
+
 function invoiceOut(r) {
   if (!r) return null;
   const data = JSON.parse(r.data);
   const due = r.due_date;
-  const overdue = r.status === 'open' && due && due < now().slice(0, 10);
+  const today = now().slice(0, 10);
+  // Only invoices can be overdue; an open offer past its validity is shown as expired.
+  const overdue = r.type === 'invoice' && r.status === 'open' && due && due < today;
+  const expired = r.type === 'offer' && r.status === 'open' && due && due < today;
+  const credited = Number(r.credited) || 0;
   return {
-    ...data, id: r.id, number: r.number, type: r.type, status: overdue ? 'overdue' : r.status, customerId: r.customer_id,
+    ...data, id: r.id, number: r.number, type: r.type, status: overdue ? 'overdue' : expired ? 'expired' : r.status, customerId: r.customer_id,
+    credited, amountDue: Math.round((r.total - credited) * 100) / 100,
     total: r.total, pdfKey: r.pdf_key, finalizedAt: r.finalized_at, sentAt: r.sent_at, sentTo: r.sent_to, paidAt: r.paid_at,
     relatedId: r.related_id, createdAt: r.created_at, updatedAt: r.updated_at,
     remindedAt: r.reminded_at ?? null, reminderCount: r.reminder_count ?? 0,
   };
 }
 
-const DATA_FIELDS = ['type', 'taxCase', 'issueDate', 'serviceFrom', 'serviceTo', 'dueDate', 'customer', 'items', 'intro', 'outro', 'payLink', 'orderRef', 'preceding'];
+const DATA_FIELDS = ['type', 'taxCase', 'issueDate', 'serviceFrom', 'serviceTo', 'dueDate', 'paymentDays', 'validUntil', 'customer', 'items', 'intro', 'outro', 'payLink', 'orderRef', 'preceding', 'basedOn'];
 const pickData = b => Object.fromEntries(DATA_FIELDS.filter(k => b[k] !== undefined).map(k => [k, b[k]]));
 
 // Reminder stats come from the event log, so no schema change is needed.
 const SELECT_INV = `SELECT i.*,
   (SELECT MAX(at) FROM invoice_events e WHERE e.invoice_id = i.id AND e.type = 'reminder') AS reminded_at,
-  (SELECT COUNT(*) FROM invoice_events e WHERE e.invoice_id = i.id AND e.type = 'reminder') AS reminder_count
+  (SELECT COUNT(*) FROM invoice_events e WHERE e.invoice_id = i.id AND e.type = 'reminder') AS reminder_count,
+  (SELECT COALESCE(SUM(k.total), 0) FROM invoices k WHERE k.related_id = i.id AND k.type = 'credit' AND k.status != 'draft') AS credited
   FROM invoices i`;
 const getInvoice = (env, id) => env.DB.prepare(`${SELECT_INV} WHERE i.id = ?`).bind(id).first();
 
@@ -132,14 +149,16 @@ export async function handleInvoices(request, env, url, json) {
   }
 
   /* ── Invoices ─────────────────────────────────────────────────────────── */
-  if (path === '/api/invoices' && method === 'GET') {
-    const { results } = await env.DB.prepare(`${SELECT_INV} ORDER BY COALESCE(i.issue_date, i.created_at) DESC, i.created_at DESC`).all();
+  if ((path === '/api/invoices' || path === '/api/offers') && method === 'GET') {
+    const types = path === '/api/offers' ? "('offer','order')" : "('invoice','credit')";
+    const { results } = await env.DB.prepare(`${SELECT_INV} WHERE i.type IN ${types} ORDER BY COALESCE(i.issue_date, i.created_at) DESC, i.created_at DESC`).all();
     return json(results.map(invoiceOut));
   }
   if (path === '/api/invoices' && method === 'POST') {
     const b = await request.json();
     const id = uid();
     const data = pickData(b);
+    if (!DOC[data.type || 'invoice']) return json({ error: 'Unbekannte Belegart.' }, 400);
     await env.DB.prepare(`INSERT INTO invoices (id, type, status, customer_id, data, total, issue_date, due_date, related_id, created_at, updated_at)
       VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?)`)
       .bind(id, data.type || 'invoice', b.customerId || null, JSON.stringify(data), Number(b.total) || 0, data.issueDate || null, data.dueDate || null, b.relatedId || null, now(), now()).run();
@@ -150,7 +169,8 @@ export async function handleInvoices(request, env, url, json) {
   if ((m = path.match(/^\/api\/invoices\/([^/]+)(?:\/([a-z-]+))?$/))) {
     const [, id, action] = m;
     const row = await getInvoice(env, id);
-    if (!row) return json({ error: 'Rechnung nicht gefunden' }, 404);
+    if (!row) return json({ error: 'Beleg nicht gefunden' }, 404);
+    const kind = (DOC[row.type] || DOC.invoice).label;
     const draft = row.status === 'draft';
     // Imported legacy invoices (sent before the dashboard existed) are view-only: no edits, mails or status changes.
     if (JSON.parse(row.data).imported && method !== 'GET') return json({ error: 'Importierte Altrechnung – nur Ansicht.' }, 409);
@@ -162,7 +182,7 @@ export async function handleInvoices(request, env, url, json) {
     }
 
     if (!action && method === 'PUT') {
-      if (!draft) return json({ error: 'Festgeschriebene Rechnungen können nicht mehr geändert werden (GoBD). Erstelle eine Rechnungskorrektur.' }, 409);
+      if (!draft) return json({ error: QUOTES.includes(row.type) ? `Festgeschriebene Belege können nicht mehr geändert werden (GoBD). Erstelle eine neue Version.` : 'Festgeschriebene Rechnungen können nicht mehr geändert werden (GoBD). Erstelle eine Rechnungskorrektur.' }, 409);
       const b = await request.json();
       const data = { ...JSON.parse(row.data), ...pickData(b) };
       await env.DB.prepare('UPDATE invoices SET data=?, customer_id=?, total=?, issue_date=?, due_date=?, type=?, updated_at=? WHERE id=?')
@@ -186,18 +206,56 @@ export async function handleInvoices(request, env, url, json) {
       const data = { ...JSON.parse(row.data), ...pickData(b) };
       const s = await getSettings(env);
       const year = (data.issueDate || now()).slice(0, 4);
-      const credit = (data.type || row.type) === 'credit';
-      const prefix = credit ? (s.creditPrefix || 'RK') : (s.invoicePrefix || 'RE');
+      const type = row.type;
+      const credit = type === 'credit';
+      const prefix = (DOC[type] || DOC.invoice).prefix(s);
+      data.seller = s; // seller data as printed on the invoice
+      const total = Number(b.total) || row.total;
+      const src = row.related_id ? await getInvoice(env, row.related_id) : null;
+      let status = 'open';
+      // All checks happen before the number is drawn, so a rejected finalize never leaves a gap.
+      if (credit && src && total > Math.round((src.total - (Number(src.credited) || 0)) * 100) / 100 + 0.005) {
+        return json({ error: `Die Korrektur (${total.toFixed(2)} €) ist höher als der noch offene Rechnungsbetrag (${(src.total - (Number(src.credited) || 0)).toFixed(2)} €).` }, 409);
+      }
+      if (credit && src && src.status === 'cancelled') return json({ error: 'Die Rechnung ist bereits storniert.' }, 409);
       const seq = await nextCounter(env, `${prefix}-${year}`);
       const number = `${env.IS_DEV ? 'DEV-' : ''}${prefix}-${year}-${String(seq).padStart(4, '0')}`;
-      data.seller = s; // seller data as printed on the invoice
-      await env.DB.prepare(`UPDATE invoices SET number=?, status='open', data=?, total=?, issue_date=?, due_date=?, finalized_at=?, updated_at=? WHERE id=?`)
-        .bind(number, JSON.stringify(data), Number(b.total) || row.total, data.issueDate, data.dueDate || null, now(), now(), id).run();
-      if (credit && row.related_id) {
-        await env.DB.prepare("UPDATE invoices SET status='cancelled', updated_at=? WHERE id=?").bind(now(), row.related_id).run();
-        await logEvent(env, row.related_id, 'cancelled', number);
+
+      // Storno / correction: a full correction cancels the invoice. If the invoice was not paid yet nothing
+      // has to be refunded, so the correction is settled right away; if it was paid, it is "to refund".
+      if (credit && src) {
+        const remaining = Math.round((src.total - (Number(src.credited) || 0)) * 100) / 100;
+        data.fullCancel = total >= remaining - 0.005 && !(Number(src.credited) > 0);
+        data.originalPaid = src.status === 'paid';
+        status = data.originalPaid ? 'open' : 'settled';
       }
+      await env.DB.prepare(`UPDATE invoices SET number=?, status=?, data=?, total=?, issue_date=?, due_date=?, finalized_at=?, updated_at=? WHERE id=?`)
+        .bind(number, status, JSON.stringify(data), total, data.issueDate, data.dueDate || null, now(), now(), id).run();
       await logEvent(env, id, 'finalized', number);
+
+      if (credit && src) {
+        const remaining = Math.round((src.total - (Number(src.credited) || 0) - total) * 100) / 100;
+        if (remaining <= 0.005) {
+          await env.DB.prepare("UPDATE invoices SET status='cancelled', updated_at=? WHERE id=?").bind(now(), src.id).run();
+          await logEvent(env, src.id, 'cancelled', number);
+        } else {
+          await logEvent(env, src.id, 'corrected', `${number} · −${total.toFixed(2)} €, noch ${remaining.toFixed(2)} €`);
+        }
+        if (status === 'settled') await logEvent(env, id, 'settled', `mit ${src.number} verrechnet`);
+      }
+      // Follow-up documents move their source along: offer → new version / order confirmation / invoice.
+      if (src && type === 'offer' && src.type === 'offer' && ['open', 'declined'].includes(src.status)) {
+        await env.DB.prepare("UPDATE invoices SET status='superseded', updated_at=? WHERE id=?").bind(now(), src.id).run();
+        await logEvent(env, src.id, 'superseded', number);
+      }
+      if (src && type === 'order' && src.type === 'offer' && src.status === 'open') {
+        await env.DB.prepare("UPDATE invoices SET status='accepted', updated_at=? WHERE id=?").bind(now(), src.id).run();
+        await logEvent(env, src.id, 'accepted', `Auftragsbestätigung ${number}`);
+      }
+      if (src && type === 'invoice' && QUOTES.includes(src.type) && ['open', 'accepted'].includes(src.status)) {
+        await env.DB.prepare("UPDATE invoices SET status='invoiced', updated_at=? WHERE id=?").bind(now(), src.id).run();
+        await logEvent(env, src.id, 'invoiced', number);
+      }
       return json(invoiceOut(await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(id).first()));
     }
 
@@ -239,8 +297,8 @@ export async function handleInvoices(request, env, url, json) {
       const s = inv.seller || await getSettings(env);
       const mail = invoiceEmail(inv, s, b);
       const obj = await env.DELIVERIES.get(row.pdf_key);
-      const attachments = [{ filename: `${row.type === 'credit' ? 'Rechnungskorrektur' : 'Rechnung'}_${row.number}.pdf`, content: toBase64(await obj.arrayBuffer()) }];
-      if (b.xml) attachments.push({ filename: `${row.number}_xrechnung.xml`, content: btoa(unescape(encodeURIComponent(b.xml))) });
+      const attachments = [{ filename: `${kind.replace(/[^\wäöüÄÖÜß]+/g, '')}_${row.number}.pdf`, content: toBase64(await obj.arrayBuffer()) }];
+      if (b.xml && !QUOTES.includes(row.type)) attachments.push({ filename: `${row.number}_xrechnung.xml`, content: btoa(unescape(encodeURIComponent(b.xml))) });
       try {
         await sendMail(env, {
           from: `${s.company || 'Dotiy'} <payments@dotiy.de>`,
@@ -303,7 +361,7 @@ export async function handleInvoices(request, env, url, json) {
     }
 
     if (action === 'paid' && method === 'POST') {
-      if (draft || row.status === 'cancelled') return json({ error: 'Nur offene Rechnungen können bezahlt werden.' }, 409);
+      if (draft || row.status === 'cancelled' || QUOTES.includes(row.type) || row.status === 'settled') return json({ error: 'Nur offene Rechnungen können bezahlt werden.' }, 409);
       const b = await request.json().catch(() => ({}));
       const paid = b.paid === false ? null : (b.date || now().slice(0, 10));
       await env.DB.prepare('UPDATE invoices SET status=?, paid_at=?, updated_at=? WHERE id=?').bind(paid ? 'paid' : 'open', paid, now(), id).run();
@@ -311,22 +369,77 @@ export async function handleInvoices(request, env, url, json) {
       return json(invoiceOut(await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(id).first()));
     }
 
+    // Offer outcome set by hand (accepted / declined), or back to open.
+    if (action === 'status' && method === 'POST') {
+      if (row.type !== 'offer' || draft) return json({ error: 'Nur festgeschriebene Angebote haben einen Status.' }, 409);
+      const b = await request.json().catch(() => ({}));
+      const next = { accepted: 'accepted', declined: 'declined', open: 'open' }[b.status];
+      if (!next || !['open', 'accepted', 'declined'].includes(row.status)) return json({ error: 'Dieser Status ist hier nicht möglich.' }, 409);
+      await env.DB.prepare('UPDATE invoices SET status=?, updated_at=? WHERE id=?').bind(next, now(), id).run();
+      await logEvent(env, id, next === 'open' ? 'reopened' : next, b.note || null);
+      return json(invoiceOut(await getInvoice(env, id)));
+    }
+
+    // Follow-up document as a draft: offer → new version / order confirmation / invoice, order → invoice.
+    // The source changes its status only when the new document is finalized.
+    if ((action === 'convert' || action === 'revise') && method === 'POST') {
+      const b = await request.json().catch(() => ({}));
+      const to = action === 'revise' ? 'offer' : b.to;
+      const allowed = row.type === 'offer' ? ['offer', 'order', 'invoice'] : row.type === 'order' ? ['invoice'] : [];
+      if (draft || !allowed.includes(to) || ['superseded', 'invoiced'].includes(row.status)) return json({ error: 'Daraus kann gerade kein neuer Beleg erstellt werden.' }, 409);
+      const existing = await env.DB.prepare("SELECT id FROM invoices WHERE related_id = ? AND type = ? AND status = 'draft'").bind(id, to).first();
+      if (existing) return json(invoiceOut(await getInvoice(env, existing.id)));
+      const s = await getSettings(env);
+      const src = JSON.parse(row.data);
+      const today = now().slice(0, 10);
+      const days = Number(src.paymentDays ?? s.paymentDays) || 14;
+      const data = {
+        ...pickData(src), type: to, issueDate: today, preceding: undefined, seller: undefined,
+        basedOn: { type: row.type, number: row.number, date: row.issue_date },
+        intro: to === 'invoice' ? s.defaultIntro : to === 'order' ? ORDER_INTRO : src.intro,
+        outro: to === 'invoice' ? s.defaultOutro : src.outro,
+        payLink: to === 'invoice' ? { enabled: !!s.payLinkDefault && !!s.payLinkUrl, url: s.payLinkUrl || '' } : undefined,
+        paymentDays: days,
+      };
+      if (to === 'invoice') { data.dueDate = new Date(Date.now() + days * 864e5).toISOString().slice(0, 10); data.serviceFrom = src.serviceFrom || today; }
+      if (to === 'offer') data.validUntil = new Date(Date.now() + (Number(s.offerValidDays) || 30) * 864e5).toISOString().slice(0, 10);
+      data.dueDate = to === 'offer' ? data.validUntil : data.dueDate || null;
+      const newId = uid();
+      await env.DB.prepare(`INSERT INTO invoices (id, type, status, customer_id, data, total, issue_date, due_date, related_id, created_at, updated_at)
+        VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?)`).bind(newId, to, row.customer_id, JSON.stringify(data), row.total, today, data.dueDate, id, now(), now()).run();
+      await logEvent(env, newId, 'created', `${action === 'revise' ? 'Neue Version von' : 'Aus'} ${DOC[row.type].label} ${row.number}`);
+      return json(invoiceOut(await getInvoice(env, newId)));
+    }
+
     // Creates a credit-note draft that mirrors the invoice; finalizing it marks the original as cancelled.
     if (action === 'cancel' && method === 'POST') {
-      if (draft || row.type === 'credit' || row.status === 'cancelled') return json({ error: 'Diese Rechnung kann nicht storniert werden.' }, 409);
+      if (draft || row.type !== 'invoice' || row.status === 'cancelled') return json({ error: 'Diese Rechnung kann nicht storniert werden.' }, 409);
+      const left = Math.round((row.total - (Number(row.credited) || 0)) * 100) / 100;
+      if (left <= 0.005) return json({ error: 'Diese Rechnung ist bereits vollständig korrigiert.' }, 409);
       const existing = await env.DB.prepare("SELECT id FROM invoices WHERE related_id = ? AND status = 'draft'").bind(id).first();
       if (existing) return json(invoiceOut(await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(existing.id).first()));
       const src = JSON.parse(row.data);
       const newId = uid();
       const today = now().slice(0, 10);
+      // After a partial correction only the rest is left: one line "Restbetrag" instead of all original items.
+      let items = src.items;
+      const rates = [...new Set((src.items || []).map(it => Number(it.vat ?? 19)))];
+      if (Number(row.credited) > 0 && rates.length <= 1) {
+        const rate = src.taxCase === 'standard' || !src.taxCase ? (rates[0] ?? 19) : 0;
+        const net = Math.floor((left / (1 + rate / 100)) * 100) / 100;
+        items = [{ name: `Restbetrag zu Rechnung ${row.number}`, description: '', qty: 1, unit: 'LS', price: net, vat: rates[0] ?? 19 }];
+      }
       const data = {
-        ...pickData(src), type: 'credit', issueDate: today, dueDate: today,
+        ...pickData(src), type: 'credit', issueDate: today, dueDate: today, basedOn: undefined,
+        items,
         preceding: { number: row.number, date: row.issue_date },
-        intro: `Hiermit storniere ich die Rechnung ${row.number} vom ${row.issue_date.split('-').reverse().join('.')} vollständig.`,
+        // Draft hints for the preview; recomputed when the correction is finalized.
+        originalDue: left, originalPaid: row.status === 'paid', fullCancel: !(Number(row.credited) > 0),
+        intro: `Hiermit storniere ich die Rechnung ${row.number} vom ${row.issue_date.split('-').reverse().join('.')}${Number(row.credited) > 0 ? ' (Restbetrag)' : ''}.`,
         payLink: { enabled: false, url: '' },
       };
       await env.DB.prepare(`INSERT INTO invoices (id, type, status, customer_id, data, total, issue_date, due_date, related_id, created_at, updated_at)
-        VALUES (?, 'credit', 'draft', ?, ?, ?, ?, ?, ?, ?, ?)`).bind(newId, row.customer_id, JSON.stringify(data), row.total, today, today, id, now(), now()).run();
+        VALUES (?, 'credit', 'draft', ?, ?, ?, ?, ?, ?, ?, ?)`).bind(newId, row.customer_id, JSON.stringify(data), Number(row.credited) > 0 ? left : row.total, today, today, id, now(), now()).run();
       await logEvent(env, newId, 'created', `Storno zu ${row.number}`);
       return json(invoiceOut(await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(newId).first()));
     }

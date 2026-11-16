@@ -91,7 +91,8 @@ const nameTokens = name => norm(name).normalize('NFKD').replace(/[\u0300-\u036f]
 
 async function invoicesFor(env, status) {
   const { results } = await env.DB.prepare(
-    `SELECT i.id, i.number, i.total, i.issue_date, i.paid_at, i.data, c.name AS cname FROM invoices i LEFT JOIN customers c ON c.id = i.customer_id
+    `SELECT i.id, i.number, i.total - (SELECT COALESCE(SUM(k.total), 0) FROM invoices k WHERE k.related_id = i.id AND k.type = 'credit' AND k.status != 'draft') AS total,
+       i.issue_date, i.paid_at, i.data, c.name AS cname FROM invoices i LEFT JOIN customers c ON c.id = i.customer_id
      WHERE i.type = 'invoice' AND i.status = ? ${status === 'paid' ? 'AND NOT EXISTS (SELECT 1 FROM bank_tx t WHERE t.invoice_id = i.id AND t.kind = \'income\')' : ''}
      ORDER BY i.due_date, i.number`
   ).bind(status).all();
