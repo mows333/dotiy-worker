@@ -132,6 +132,32 @@ export async function handleInvoices(request, env, url, json) {
         (b.country || 'DE').toUpperCase(), b.vatId || null, b.buyerRef || null, b.notes || null, now(), now()).run();
     return json(customerOut(await env.DB.prepare('SELECT * FROM customers WHERE id = ?').bind(id).first()));
   }
+  // Interessent → Kunde: legt aus dem Empfänger eines Belegs einen Kunden an und verknüpft
+  // alle Belege ohne Kunden-ID mit gleicher E-Mail bzw. gleichem Namen (nur die Verknüpfung, Snapshots bleiben unverändert).
+  if (path === '/api/customers/from-document' && method === 'POST') {
+    const b = await request.json();
+    const row = b.invoiceId && await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(b.invoiceId).first();
+    if (!row) return json({ error: 'Beleg nicht gefunden' }, 404);
+    if (row.customer_id) return json({ error: 'Der Empfänger ist bereits ein Kunde.' }, 409);
+    const c = JSON.parse(row.data).customer;
+    if (!c?.name?.trim()) return json({ error: 'Beleg hat keinen Empfänger.' }, 400);
+    const s = await getSettings(env);
+    const id = uid();
+    const number = await nextCustomerNumber(env, s.customerPrefix ?? 'C');
+    await env.DB.prepare(`INSERT INTO customers (id, number, name, contact, email, phone, street, street2, zip, city, country, vat_id, buyer_ref, notes, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(id, number, c.name.trim(), c.contact || null, c.email || null, c.phone || null, c.street || null, c.street2 || null, c.zip || null, c.city || null,
+        (c.country || 'DE').toUpperCase(), c.vatId || null, c.buyerRef || null, null, now(), now()).run();
+    const mail = (c.email || '').trim().toLowerCase(), name = c.name.trim().toLowerCase();
+    const { results } = await env.DB.prepare('SELECT id, data FROM invoices WHERE customer_id IS NULL').all();
+    const linked = results.filter(r => {
+      if (r.id === row.id) return true;
+      const x = JSON.parse(r.data).customer || {};
+      return mail ? (x.email || '').trim().toLowerCase() === mail : (x.name || '').trim().toLowerCase() === name;
+    }).map(r => r.id);
+    if (linked.length) await env.DB.batch(linked.map(i => env.DB.prepare('UPDATE invoices SET customer_id = ?, updated_at = ? WHERE id = ?').bind(id, now(), i)));
+    return json({ ...customerOut(await env.DB.prepare('SELECT * FROM customers WHERE id = ?').bind(id).first()), linked: linked.length });
+  }
   if ((m = path.match(/^\/api\/customers\/([^/]+)$/))) {
     if (method === 'PUT') {
       const b = await request.json();
@@ -186,7 +212,7 @@ export async function handleInvoices(request, env, url, json) {
       const b = await request.json();
       const data = { ...JSON.parse(row.data), ...pickData(b) };
       await env.DB.prepare('UPDATE invoices SET data=?, customer_id=?, total=?, issue_date=?, due_date=?, type=?, updated_at=? WHERE id=?')
-        .bind(JSON.stringify(data), b.customerId ?? row.customer_id, Number(b.total) || 0, data.issueDate || null, data.dueDate || null, data.type || 'invoice', now(), id).run();
+        .bind(JSON.stringify(data), ('customerId' in b ? (b.customerId || null) : row.customer_id), Number(b.total) || 0, data.issueDate || null, data.dueDate || null, data.type || 'invoice', now(), id).run();
       return json(invoiceOut(await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(id).first()));
     }
 
