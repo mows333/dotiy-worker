@@ -75,7 +75,7 @@ function invoiceOut(r) {
   };
 }
 
-const DATA_FIELDS = ['type', 'taxCase', 'issueDate', 'serviceFrom', 'serviceTo', 'dueDate', 'paymentDays', 'validUntil', 'customer', 'items', 'intro', 'outro', 'payLink', 'orderRef', 'preceding', 'basedOn'];
+const DATA_FIELDS = ['type', 'taxCase', 'issueDate', 'serviceFrom', 'serviceTo', 'dueDate', 'paymentDays', 'validUntil', 'customer', 'items', 'discount', 'intro', 'outro', 'payLink', 'orderRef', 'preceding', 'basedOn'];
 const pickData = b => Object.fromEntries(DATA_FIELDS.filter(k => b[k] !== undefined).map(k => [k, b[k]]));
 
 // Reminder stats come from the event log, so no schema change is needed.
