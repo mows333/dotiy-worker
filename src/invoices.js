@@ -88,9 +88,13 @@ function invoiceOut(r) {
   const overdue = r.type === 'invoice' && r.status === 'open' && due && due < today;
   const expired = r.type === 'offer' && r.status === 'open' && due && due < today;
   const credited = Number(r.credited) || 0;
+  // Payments: recorded rows, or the full amount for invoices marked paid without rows (older data, bank match).
+  const rows = Number(r.paid_sum) || 0;
+  const paidSum = r.type !== 'invoice' ? 0 : r.status === 'paid' && rows < 0.005 ? r.total : Math.round(rows * 100) / 100;
+  const balance = r.type !== 'invoice' || r.status === 'paid' ? 0 : Math.max(0, Math.round((r.total - credited - paidSum) * 100) / 100);
   return {
     ...data, id: r.id, number: r.number, type: r.type, status: overdue ? 'overdue' : expired ? 'expired' : r.status, customerId: r.customer_id,
-    credited, amountDue: Math.round((r.total - credited) * 100) / 100,
+    credited, amountDue: Math.round((r.total - credited) * 100) / 100, paidSum, balance,
     total: r.total, pdfKey: r.pdf_key, finalizedAt: r.finalized_at, sentAt: r.sent_at, sentTo: r.sent_to, paidAt: r.paid_at,
     relatedId: r.related_id, createdAt: r.created_at, updatedAt: r.updated_at,
     remindedAt: r.reminded_at ?? null, reminderCount: r.reminder_count ?? 0,
@@ -104,7 +108,8 @@ const pickData = b => Object.fromEntries(DATA_FIELDS.filter(k => b[k] !== undefi
 const SELECT_INV = `SELECT i.*,
   (SELECT MAX(at) FROM invoice_events e WHERE e.invoice_id = i.id AND e.type = 'reminder') AS reminded_at,
   (SELECT COUNT(*) FROM invoice_events e WHERE e.invoice_id = i.id AND e.type = 'reminder') AS reminder_count,
-  (SELECT COALESCE(SUM(k.total), 0) FROM invoices k WHERE k.related_id = i.id AND k.type = 'credit' AND k.status != 'draft') AS credited
+  (SELECT COALESCE(SUM(k.total), 0) FROM invoices k WHERE k.related_id = i.id AND k.type = 'credit' AND k.status != 'draft') AS credited,
+  (SELECT COALESCE(SUM(p.amount), 0) FROM payments p WHERE p.invoice_id = i.id) AS paid_sum
   FROM invoices i`;
 const getInvoice = (env, id) => env.DB.prepare(`${SELECT_INV} WHERE i.id = ?`).bind(id).first();
 
@@ -226,7 +231,8 @@ export async function handleInvoices(request, env, url, json) {
     if (!action && method === 'GET') {
       const inv = invoiceOut(row);
       const { results } = await env.DB.prepare('SELECT at, type, detail FROM invoice_events WHERE invoice_id = ? ORDER BY id DESC').bind(id).all();
-      return json({ ...inv, events: results });
+      const pays = await env.DB.prepare('SELECT id, amount, date, note FROM payments WHERE invoice_id = ? ORDER BY date, created_at').bind(id).all();
+      return json({ ...inv, events: results, payments: pays.results });
     }
 
     if (!action && method === 'PUT') {
@@ -281,7 +287,11 @@ export async function handleInvoices(request, env, url, json) {
       if (credit && src) {
         const remaining = Math.round((src.total - (Number(src.credited) || 0)) * 100) / 100;
         data.fullCancel = total >= remaining - 0.005 && !(Number(src.credited) > 0);
-        data.originalPaid = src.status === 'paid';
+        // Refund = what the customer already paid beyond the invoice amount that remains after this correction.
+        const paidIn = src.status === 'paid' ? remaining : Math.min(Number(src.paid_sum) || 0, remaining);
+        const refund = Math.round(Math.max(0, Math.min(total, paidIn - (remaining - total))) * 100) / 100;
+        data.refundAmount = refund;
+        data.originalPaid = refund > 0.005;
         status = data.originalPaid ? 'open' : 'settled';
       }
       await env.DB.prepare(`UPDATE invoices SET number=?, status=?, data=?, total=?, issue_date=?, due_date=?, finalized_at=?, updated_at=? WHERE id=?`)
@@ -295,6 +305,11 @@ export async function handleInvoices(request, env, url, json) {
           await logEvent(env, src.id, 'cancelled', number);
         } else {
           await logEvent(env, src.id, 'corrected', `${number} · −${total.toFixed(2)} €, noch ${remaining.toFixed(2)} €`);
+          // The remaining amount may already be covered by partial payments → the invoice is paid.
+          if (src.status === 'open' && (Number(src.paid_sum) || 0) >= remaining - 0.005 && Number(src.paid_sum) > 0) {
+            await env.DB.prepare("UPDATE invoices SET status='paid', paid_at=?, updated_at=? WHERE id=?").bind(now().slice(0, 10), now(), src.id).run();
+            await logEvent(env, src.id, 'paid', 'durch Zahlungen gedeckt');
+          }
         }
         if (status === 'settled') await logEvent(env, id, 'settled', `mit ${src.number} verrechnet`);
       }
@@ -419,9 +434,48 @@ export async function handleInvoices(request, env, url, json) {
       if (draft || row.status === 'cancelled' || QUOTES.includes(row.type) || row.status === 'settled') return json({ error: 'Nur offene Rechnungen können bezahlt werden.' }, 409);
       const b = await request.json().catch(() => ({}));
       const paid = b.paid === false ? null : (b.date || now().slice(0, 10));
+      if (row.type === 'invoice') {
+        // "Bezahlt" books the remaining balance as a payment; "zurücksetzen" removes all payments.
+        const cur = invoiceOut(await getInvoice(env, id));
+        if (paid && cur.balance > 0.005) {
+          await env.DB.prepare('INSERT INTO payments (id, invoice_id, amount, date, note, created_at) VALUES (?, ?, ?, ?, ?, ?)').bind(uid(), id, cur.balance, paid, null, now()).run();
+        }
+        if (!paid) await env.DB.prepare('DELETE FROM payments WHERE invoice_id = ?').bind(id).run();
+      }
       await env.DB.prepare('UPDATE invoices SET status=?, paid_at=?, updated_at=? WHERE id=?').bind(paid ? 'paid' : 'open', paid, now(), id).run();
       await logEvent(env, id, paid ? 'paid' : 'unpaid', paid);
-      return json(invoiceOut(await env.DB.prepare('SELECT * FROM invoices WHERE id = ?').bind(id).first()));
+      return json(invoiceOut(await getInvoice(env, id)));
+    }
+
+    // Partial payments (entered by hand): add one, or remove one with /payments?pid=…
+    if (action === 'payments' && method === 'POST') {
+      if (draft || row.type !== 'invoice' || ['cancelled', 'settled', 'paid'].includes(row.status)) return json({ error: 'Für diese Rechnung kann keine Zahlung erfasst werden.' }, 409);
+      const b = await request.json().catch(() => ({}));
+      const amount = Math.round(Number(b.amount) * 100) / 100;
+      const date = /^\d{4}-\d{2}-\d{2}$/.test(b.date || '') ? b.date : now().slice(0, 10);
+      const cur = invoiceOut(await getInvoice(env, id));
+      if (!(amount > 0)) return json({ error: 'Bitte einen Betrag größer 0 eingeben.' }, 400);
+      if (amount > cur.balance + 0.005) return json({ error: `Die Zahlung (${amount.toFixed(2)} €) ist höher als der offene Betrag (${cur.balance.toFixed(2)} €).` }, 409);
+      await env.DB.prepare('INSERT INTO payments (id, invoice_id, amount, date, note, created_at) VALUES (?, ?, ?, ?, ?, ?)').bind(uid(), id, amount, date, String(b.note || '').slice(0, 200) || null, now()).run();
+      await logEvent(env, id, 'payment', `${amount.toFixed(2)} € am ${date.split('-').reverse().join('.')}${b.note ? ` · ${String(b.note).slice(0, 80)}` : ''}`);
+      if (cur.balance - amount <= 0.005) {
+        const last = await env.DB.prepare('SELECT MAX(date) AS d FROM payments WHERE invoice_id = ?').bind(id).first();
+        await env.DB.prepare("UPDATE invoices SET status='paid', paid_at=?, updated_at=? WHERE id=?").bind(last.d, now(), id).run();
+        await logEvent(env, id, 'paid', last.d);
+      }
+      return json(invoiceOut(await getInvoice(env, id)));
+    }
+    if (action === 'payments' && method === 'DELETE') {
+      if (row.type !== 'invoice' || row.status === 'cancelled') return json({ error: 'Nicht möglich.' }, 409);
+      const pid = url.searchParams.get('pid');
+      const pay = await env.DB.prepare('SELECT * FROM payments WHERE id = ? AND invoice_id = ?').bind(pid, id).first();
+      if (!pay) return json({ error: 'Zahlung nicht gefunden.' }, 404);
+      await env.DB.prepare('DELETE FROM payments WHERE id = ?').bind(pid).run();
+      await logEvent(env, id, 'payment-removed', `${Number(pay.amount).toFixed(2)} € vom ${pay.date.split('-').reverse().join('.')}`);
+      if (row.status === 'paid') {
+        await env.DB.prepare("UPDATE invoices SET status='open', paid_at=NULL, updated_at=? WHERE id=?").bind(now(), id).run();
+      }
+      return json(invoiceOut(await getInvoice(env, id)));
     }
 
     // Offer outcome set by hand (accepted / declined), or back to open.
@@ -489,7 +543,7 @@ export async function handleInvoices(request, env, url, json) {
         items,
         preceding: { number: row.number, date: row.issue_date },
         // Draft hints for the preview; recomputed when the correction is finalized.
-        originalDue: left, originalPaid: row.status === 'paid', fullCancel: !(Number(row.credited) > 0),
+        originalDue: left, originalPaid: row.status === 'paid', paidSoFar: row.status === 'paid' ? 0 : Math.round((Number(row.paid_sum) || 0) * 100) / 100, fullCancel: !(Number(row.credited) > 0),
         // Differenz-Modus: the editor can derive the credit from a corrected invoice state (only for untouched invoices).
         diff: Number(row.credited) > 0 ? undefined : { enabled: false, base: { items: src.items, discount: src.discount || null }, items: JSON.parse(JSON.stringify(src.items)) },
         intro: `Hiermit storniere ich die Rechnung ${row.number} vom ${row.issue_date.split('-').reverse().join('.')}${Number(row.credited) > 0 ? ' (Restbetrag)' : ''}.`,
