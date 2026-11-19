@@ -97,7 +97,7 @@ function invoiceOut(r) {
   };
 }
 
-const DATA_FIELDS = ['type', 'taxCase', 'issueDate', 'serviceFrom', 'serviceTo', 'dueDate', 'paymentDays', 'validUntil', 'customer', 'items', 'discount', 'intro', 'outro', 'payLink', 'orderRef', 'preceding', 'basedOn'];
+const DATA_FIELDS = ['type', 'taxCase', 'issueDate', 'serviceFrom', 'serviceTo', 'dueDate', 'paymentDays', 'validUntil', 'customer', 'items', 'discount', 'intro', 'outro', 'payLink', 'orderRef', 'preceding', 'basedOn', 'diff'];
 const pickData = b => Object.fromEntries(DATA_FIELDS.filter(k => b[k] !== undefined).map(k => [k, b[k]]));
 
 // Reminder stats come from the event log, so no schema change is needed.
@@ -490,6 +490,8 @@ export async function handleInvoices(request, env, url, json) {
         preceding: { number: row.number, date: row.issue_date },
         // Draft hints for the preview; recomputed when the correction is finalized.
         originalDue: left, originalPaid: row.status === 'paid', fullCancel: !(Number(row.credited) > 0),
+        // Differenz-Modus: the editor can derive the credit from a corrected invoice state (only for untouched invoices).
+        diff: Number(row.credited) > 0 ? undefined : { enabled: false, base: { items: src.items, discount: src.discount || null }, items: JSON.parse(JSON.stringify(src.items)) },
         intro: `Hiermit storniere ich die Rechnung ${row.number} vom ${row.issue_date.split('-').reverse().join('.')}${Number(row.credited) > 0 ? ' (Restbetrag)' : ''}.`,
         payLink: { enabled: false, url: '' },
       };
