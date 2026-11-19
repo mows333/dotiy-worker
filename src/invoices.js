@@ -45,6 +45,17 @@ async function nextLegacyInvoiceNumber(env, prefix, year, minNext = '') {
   return `${head}${String(Math.max((row?.n || 0) + 1, floor)).padStart(3, '0')}`;
 }
 
+// Offer / order-confirmation numbers: letter (A = Angebot, B = Bestätigung) + last digit of the year + MMDD + running number
+// of that day (A611191 = Angebot vom 19.11.2026, das erste des Tages). They carry the issue date and a per-day count only,
+// so the total number of offers sent can't be read off them. Derived from existing numbers → never collides.
+async function nextQuoteNumber(env, letter, issueDate) {
+  const d = String(issueDate || now()).slice(0, 10);   // YYYY-MM-DD
+  const head = `${letter}${d.slice(3, 4)}${d.slice(5, 7)}${d.slice(8, 10)}`;
+  const row = await env.DB.prepare('SELECT MAX(CAST(SUBSTR(number, ?) AS INTEGER)) AS n FROM invoices WHERE number GLOB ?')
+    .bind(head.length + 1, `${head}[0-9]*`).first();
+  return `${head}${(row?.n || 0) + 1}`;
+}
+
 async function nextCounter(env, name, start = 1) {
   const row = await env.DB.prepare(
     'INSERT INTO counters (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = value + 1 RETURNING value'
@@ -256,9 +267,12 @@ export async function handleInvoices(request, env, url, json) {
       }
       if (credit && src && src.status === 'cancelled') return json({ error: 'Die Rechnung ist bereits storniert.' }, 409);
       // Single-letter invoice prefix (e.g. "I") → old style I26028; anything else → RE-2026-0001.
-      const legacy = type === 'invoice' && /^[A-Z]$/.test(prefix);
+      // Credits (Storno/Korrektur) continue the invoice sequence. Offers/orders use the date-based short code.
+      const invPrefix = s.invoicePrefix || 'RE';
+      const legacy = (type === 'invoice' || type === 'credit') && /^[A-Z]$/.test(invPrefix);
       let base;
-      if (legacy) base = await nextLegacyInvoiceNumber(env, prefix, year, s.invoiceNextMin);
+      if (legacy) base = await nextLegacyInvoiceNumber(env, invPrefix, year, s.invoiceNextMin);
+      else if (QUOTES.includes(type) && /^[A-Z]$/.test(prefix)) base = await nextQuoteNumber(env, prefix, data.issueDate);
       else base = `${prefix}-${year}-${String(await nextCounter(env, `${prefix}-${year}`)).padStart(4, '0')}`;
       const number = `${env.IS_DEV ? 'DEV-' : ''}${base}`;
 
