@@ -34,6 +34,17 @@ async function nextCustomerNumber(env, prefix) {
   return `${head}${String((row?.n || 0) + 1).padStart(3, '0')}`;
 }
 
+// Invoice numbers in the old system's style: one letter + 2-digit year + 3-digit sequence (I26028).
+// Derived from the numbers that already exist, so the imported old invoices (…I26027) are continued without gaps.
+async function nextLegacyInvoiceNumber(env, prefix, year, minNext = '') {
+  const head = `${prefix}${String(year).slice(2)}`;
+  const row = await env.DB.prepare("SELECT MAX(CAST(SUBSTR(number, ?) AS INTEGER)) AS n FROM invoices WHERE number GLOB ?")
+    .bind(head.length + 1, `${head}[0-9][0-9][0-9]*`).first();
+  // Optional floor, e.g. invoiceNextMin = "I26030": the next number is at least that — only within that prefix/year.
+  const floor = String(minNext || '').startsWith(head) ? parseInt(String(minNext).slice(head.length), 10) || 0 : 0;
+  return `${head}${String(Math.max((row?.n || 0) + 1, floor)).padStart(3, '0')}`;
+}
+
 async function nextCounter(env, name, start = 1) {
   const row = await env.DB.prepare(
     'INSERT INTO counters (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = value + 1 RETURNING value'
@@ -244,8 +255,12 @@ export async function handleInvoices(request, env, url, json) {
         return json({ error: `Die Korrektur (${total.toFixed(2)} €) ist höher als der noch offene Rechnungsbetrag (${(src.total - (Number(src.credited) || 0)).toFixed(2)} €).` }, 409);
       }
       if (credit && src && src.status === 'cancelled') return json({ error: 'Die Rechnung ist bereits storniert.' }, 409);
-      const seq = await nextCounter(env, `${prefix}-${year}`);
-      const number = `${env.IS_DEV ? 'DEV-' : ''}${prefix}-${year}-${String(seq).padStart(4, '0')}`;
+      // Single-letter invoice prefix (e.g. "I") → old style I26028; anything else → RE-2026-0001.
+      const legacy = type === 'invoice' && /^[A-Z]$/.test(prefix);
+      let base;
+      if (legacy) base = await nextLegacyInvoiceNumber(env, prefix, year, s.invoiceNextMin);
+      else base = `${prefix}-${year}-${String(await nextCounter(env, `${prefix}-${year}`)).padStart(4, '0')}`;
+      const number = `${env.IS_DEV ? 'DEV-' : ''}${base}`;
 
       // Storno / correction: a full correction cancels the invoice. If the invoice was not paid yet nothing
       // has to be refunded, so the correction is settled right away; if it was paid, it is "to refund".
