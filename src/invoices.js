@@ -267,11 +267,11 @@ export async function handleInvoices(request, env, url, json) {
       }
       if (credit && src && src.status === 'cancelled') return json({ error: 'Die Rechnung ist bereits storniert.' }, 409);
       // Single-letter invoice prefix (e.g. "I") → old style I26028; anything else → RE-2026-0001.
-      // Credits (Storno/Korrektur) continue the invoice sequence. Offers/orders use the date-based short code.
-      const invPrefix = s.invoicePrefix || 'RE';
-      const legacy = (type === 'invoice' || type === 'credit') && /^[A-Z]$/.test(invPrefix);
+      // Single-letter prefixes use the short style: invoices I26030, credits (Storno/Korrektur) S26001 — each with its own sequence.
+      // Offers/orders use the date-based short code.
+      const legacy = (type === 'invoice' || type === 'credit') && /^[A-Z]$/.test(prefix);
       let base;
-      if (legacy) base = await nextLegacyInvoiceNumber(env, invPrefix, year, s.invoiceNextMin);
+      if (legacy) base = await nextLegacyInvoiceNumber(env, prefix, year, s.invoiceNextMin);
       else if (QUOTES.includes(type) && /^[A-Z]$/.test(prefix)) base = await nextQuoteNumber(env, prefix, data.issueDate);
       else base = `${prefix}-${year}-${String(await nextCounter(env, `${prefix}-${year}`)).padStart(4, '0')}`;
       const number = `${env.IS_DEV ? 'DEV-' : ''}${base}`;
